@@ -38,3 +38,8 @@ out/
 
 ### Kotlin ###
 .kotlin
+
+
+*Zone.Identifier*
+*.identifier
+*.Identifier
