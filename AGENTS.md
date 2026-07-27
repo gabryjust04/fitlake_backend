@@ -247,6 +247,57 @@ Do not let JPA entities leak into the domain unless intentionally chosen for a s
 
 ---
 
+## Authentication and Internal User Identity
+
+Firebase Authentication is the external identity provider for mobile and web clients.
+
+The backend must remain stateless and must validate Firebase ID tokens from:
+
+```text
+Authorization: Bearer <firebase-id-token>
+```
+
+Authentication flow:
+
+```text
+Firebase ID token
+→ verify signature and standard token claims with Firebase Admin SDK
+→ resolve (issuer, subject) in user_auth_identity
+→ provision user_account and user_auth_identity on first valid login
+→ expose the internal UserId through CurrentUserProvider
+→ application use case
+```
+
+Important rules:
+
+* Firebase authenticates external identities; it does not own the FitLake domain user.
+* `user_account.user_id` is the canonical application identity used by all domain data and ownership checks.
+* Firebase UID must never be used as a domain ID or foreign key.
+* The future `daily` module receives only the internal `UserId` and must not depend on provider subjects or tokens.
+* Resolve Firebase users only by `(issuer, external_subject)`, never by email.
+* Email is mutable profile data and may be duplicated across internal users.
+* A Firebase email claim may seed `user_account.email` even when it is not verified. A later non-null email claim for the same `(issuer, external_subject)` synchronizes the stored email, regardless of verification status.
+* A missing or blank Firebase email claim must not erase an existing application email.
+* Email synchronization must never be used to resolve, merge, or reassign accounts.
+* Token verification must happen before opening the provisioning database transaction.
+* Provisioning must be idempotent and recover safely from concurrent first-login unique-constraint races.
+* Controllers and application services must use `CurrentUserProvider`; they must not parse bearer tokens or depend on Firebase SDK classes.
+* Domain objects and repositories must not access Spring Security or `CurrentUserProvider`.
+* Firebase SDK classes must remain inside `auth.infrastructure.firebase`.
+* Do not store passwords, Firebase ID tokens, refresh tokens, API keys, or service-account credentials in the database or logs.
+* `/actuator/health`, `/v3/api-docs/**`, and Swagger UI are public; `/api/**` requires authentication; other routes are denied unless explicitly designed and documented.
+* Do not enable form login, HTTP Basic, or server-side sessions for the API.
+* Tests must use fake token verifiers and synthetic claims. Real Firebase credentials are not required for automated tests.
+* Service-account JSON files must remain outside the repository and be supplied through Application Default Credentials.
+* Secrets must never be committed.
+
+`user_auth_identity` is distinct from `user_channel_identity`:
+
+* `user_auth_identity` proves who may authenticate as an internal user.
+* `user_channel_identity` maps a Telegram or future messaging identity to an internal user for channel delivery and ingestion.
+
+---
+
 ## MVP Database
 
 Use PostgreSQL.
@@ -261,12 +312,13 @@ The MVP database contains these tables:
 
 ```text
 1. user_account
-2. user_channel_identity
-3. daily_day
-4. daily_inbox_event
-5. daily_capture
-6. ai_interpretation_log
-7. daily_metrics
+2. user_auth_identity
+3. user_channel_identity
+4. daily_day
+5. daily_inbox_event
+6. daily_capture
+7. ai_interpretation_log
+8. daily_metrics
 ```
 
 Do not introduce new database tables unless the task explicitly requires it.
@@ -285,7 +337,7 @@ Expected columns:
 
 ```text
 user_id UUID PK
-email VARCHAR nullable unique
+email VARCHAR nullable
 display_name VARCHAR nullable
 timezone VARCHAR not null default Europe/Rome
 created_at TIMESTAMPTZ
@@ -301,6 +353,49 @@ Purpose:
 Important rule:
 
 The user timezone is required for interpreting natural dates such as today, yesterday, this morning, and tonight.
+
+Email is profile data, not an authentication identifier. Do not restore a unique constraint on `user_account.email` and do not merge users by email.
+
+---
+
+## Table: user_auth_identity
+
+Maps a verified external authentication identity to one internal user.
+
+Expected columns:
+
+```text
+auth_identity_id UUID PK
+user_id UUID FK user_account
+provider VARCHAR
+issuer VARCHAR
+external_subject VARCHAR
+email_at_link_time VARCHAR nullable
+created_at TIMESTAMPTZ
+last_login_at TIMESTAMPTZ
+```
+
+Expected constraints:
+
+```text
+provider IN (FIREBASE)
+UNIQUE(issuer, external_subject)
+UNIQUE(user_id, issuer)
+```
+
+Purpose:
+
+* resolve a Firebase token to a stable internal `UserId`
+* provision an internal user on first valid login
+* support future authentication providers without leaking provider IDs into domain tables
+* retain the email observed at link time for audit without treating it as identity
+
+Important rules:
+
+* `external_subject` is the Firebase token subject/UID and is meaningful only together with `issuer`.
+* Repeated login updates `last_login_at` without creating a second user.
+* The database unique constraints are the final concurrency guard for first-login provisioning.
+* Do not use this table for Telegram chat identity; use `user_channel_identity` for channels.
 
 ---
 
@@ -1245,6 +1340,12 @@ Prioritize tests for:
 * invalid units
 * invalid quantities
 * user ownership checks
+* first-login user provisioning
+* repeated-login provisioning idempotency
+* same email with different authentication subjects
+* invalid and expired Firebase tokens
+* public health and protected API endpoint policy
+* authentication identity uniqueness and persistence mapping
 
 Recommended test style:
 
@@ -1267,5 +1368,7 @@ A task is done only when:
 * AI cannot persist or mutate state directly
 * database changes are represented by migrations
 * new tables or columns are documented
+* authenticated use cases depend on the internal `UserId`, not Firebase SDK types
+* authentication tests do not require real provider credentials
 * Telegram and mobile flows still use shared backend services
 * daily finalization remains deterministic

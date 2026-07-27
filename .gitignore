@@ -39,6 +39,16 @@ out/
 ### Kotlin ###
 .kotlin
 
+### Local environment ###
+.env
+.env.*
+!.env.example
+
+# Firebase / Google service-account credentials
+*firebase-adminsdk*.json
+firebase-service-account*.json
+service-account*.json
+
 
 *Zone.Identifier*
 *.identifier

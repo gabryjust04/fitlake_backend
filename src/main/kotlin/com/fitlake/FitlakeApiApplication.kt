@@ -1,4 +1,4 @@
-package com.fitlake.api
+package com.fitlake
 
 import org.springframework.boot.autoconfigure.SpringBootApplication
 import org.springframework.boot.runApplication
