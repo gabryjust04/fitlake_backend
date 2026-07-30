@@ -168,6 +168,42 @@ User clicks "Chiudi giornata" or says "ok giornata finita"
 
 ---
 
+## Current REST-Only Daily Slice
+
+The current implemented Daily channel is authenticated REST only. Do not require or create Telegram, AI, inbox-event, or AI-log records for precise REST actions.
+
+REST routes:
+
+```text
+POST   /api/daily/days/{date}/captures
+GET    /api/daily/days/{date}
+POST   /api/daily/captures/{captureId}/accept
+POST   /api/daily/captures/{captureId}/reject
+PUT    /api/daily/captures/{captureId}
+PATCH  /api/daily/captures/{captureId}/food-items/{itemTempId}
+DELETE /api/daily/captures/{captureId}
+POST   /api/daily/days/{date}/finalize
+GET    /api/daily/days/{date}/metrics
+```
+
+Important REST rules:
+
+* REST controllers obtain only the internal `UserId` from `CurrentUserProvider`.
+* A manual REST insertion creates a `daily_capture` with `created_by = USER_UI`, `status = OPEN`, and `source_event_id = null`.
+* The backend generates payload meal/item references when the client omits them.
+* Clients may supply stable meal/item references for precise subsequent UI edits.
+* Capture and day ownership must be checked on every command and query.
+* Returning `404` for a capture owned by another user is preferred to leaking its existence.
+* Confirmed days are immutable in the current slice; reopening is not implemented yet.
+* Finalization returns `409` while any open capture exists.
+* Only accepted captures contribute to the metrics snapshot.
+* Repeated scalar fields use the last non-null value in deterministic capture creation order.
+* Food logs concatenate meals; provided calories and macros are summed.
+* Finalization is idempotent and returns the existing snapshot for an already confirmed day.
+* REST validation errors return `400`, missing resources return `404`, and invalid state transitions return `409`.
+
+---
+
 ## AI Usage Rules
 
 AI is used only to interpret natural language.

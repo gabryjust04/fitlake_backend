@@ -1,6 +1,6 @@
 package com.fitlake.user.infrastructure
 
-import com.fitlake.user.application.port.TransactionExecutor
+import com.fitlake.shared.application.TransactionExecutor
 import org.springframework.stereotype.Component
 import org.springframework.transaction.PlatformTransactionManager
 import org.springframework.transaction.support.TransactionTemplate

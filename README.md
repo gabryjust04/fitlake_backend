@@ -1,6 +1,6 @@
 # FitLake API
 
-FitLake is a Spring Boot/Kotlin modular monolith for personal daily tracking. The current implementation contains the database foundation and Firebase Authentication boundary; Daily, Telegram, and AI use cases are not implemented yet.
+FitLake is a Spring Boot/Kotlin modular monolith for personal daily tracking. The current implementation contains Firebase Authentication and the first complete Daily MVP slice through authenticated REST APIs. Telegram and AI use cases are not implemented yet.
 
 ## Requirements
 
@@ -136,6 +136,75 @@ http://localhost:8080/v3/api-docs
 
 To call protected endpoints from Swagger UI, click **Authorize** and paste the Firebase ID token. Swagger adds the `Bearer` prefix automatically, so paste only the token itself.
 
+## Daily REST API
+
+All Daily routes require the same Firebase bearer token used by `/api/me`.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/daily/days/{date}/captures` | Create a manual `OPEN` capture and create the day if needed |
+| `GET` | `/api/daily/days/{date}` | Read the day, all captures, and finalized metrics when present |
+| `POST` | `/api/daily/captures/{captureId}/accept` | Accept an open capture |
+| `POST` | `/api/daily/captures/{captureId}/reject` | Reject an open capture |
+| `PUT` | `/api/daily/captures/{captureId}` | Replace an open or accepted capture payload |
+| `PATCH` | `/api/daily/captures/{captureId}/food-items/{itemTempId}` | Change a food item's quantity and unit |
+| `DELETE` | `/api/daily/captures/{captureId}` | Soft delete a capture without removing its database row |
+| `POST` | `/api/daily/days/{date}/finalize` | Build metrics from accepted captures and confirm the day |
+| `GET` | `/api/daily/days/{date}/metrics` | Read the finalized metrics snapshot |
+
+Dates use ISO format: `YYYY-MM-DD`.
+
+Example manual daily-fields capture:
+
+```http
+POST /api/daily/days/2026-07-28/captures
+Authorization: Bearer <FIREBASE_ID_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "type": "DAILY_FIELDS",
+  "fields": {
+    "bodyWeightKg": 78.4,
+    "sleepHours": 7.5,
+    "stepsCount": 8500,
+    "hydrationLiters": 2.2,
+    "moodLevel": 8
+  }
+}
+```
+
+Example food capture:
+
+```json
+{
+  "type": "FOOD",
+  "meals": [
+    {
+      "mealName": "colazione",
+      "items": [
+        {
+          "foodName": "avena",
+          "quantity": 40,
+          "unit": "g",
+          "calories": 150,
+          "proteinG": 5,
+          "carbsG": 27,
+          "fatG": 3
+        }
+      ]
+    }
+  ]
+}
+```
+
+`mealTempId` and `itemTempId` may be supplied by the client for deterministic UI references; when omitted, the backend generates them. Supported units are `g`, `kg`, `ml`, `l`, `unit`, and `portion`, with common Italian aliases normalized automatically.
+
+Every manual capture starts as `OPEN`. It must be accepted or rejected before finalization. An `OPEN` capture causes finalization to return `409 Conflict`. Only `ACCEPTED` captures contribute to metrics; rejected, expired, and soft-deleted captures remain stored but are excluded.
+
+For repeated scalar fields such as body weight or sleep, the last non-null value in deterministic capture creation order wins. Food meals are concatenated, and provided calories/macros are summed. Calling finalization more than once returns the existing snapshot without duplicating it.
+
 ### Firebase authentication diagnostics
 
 At startup the application logs whether Application Default Credentials were loaded and which Firebase project ID was configured. Authentication failures log the Firebase error code and a sanitized reason, while token contents, emails, and service-account data remain excluded.
@@ -157,7 +226,7 @@ $env:JAVA_HOME='C:\path\to\jdk-25'
 .\gradlew.bat test
 ```
 
-The suite includes domain and provisioning tests, filter and MVC security tests with a fake token verifier, and PostgreSQL/Flyway persistence tests through Testcontainers. No real Firebase credentials are used in tests. PostgreSQL integration tests are skipped when Docker is unavailable.
+The suite includes Daily domain/use-case tests, authenticated REST tests, filter and MVC security tests with a fake token verifier, and PostgreSQL/Flyway/JSONB persistence tests through Testcontainers. No real Firebase credentials are used in tests. PostgreSQL integration tests are skipped when Docker is unavailable.
 
 ## Current deliberate limits
 
@@ -165,4 +234,4 @@ The suite includes domain and provisioning tests, filter and MVC security tests 
 - One Firebase issuer may map to only one identity per internal user.
 - A Firebase email claim is stored even when unverified and is synchronized when it changes on later logins. A missing claim does not erase the stored value, and email is never used for account resolution or merging.
 - Display name seeds the profile on first login but later token changes do not overwrite user-managed profile data.
-- Account linking, account deletion, authorization roles, and Daily/Telegram/AI feature flows remain future work.
+- Account linking, account deletion, authorization roles, Telegram, natural-language insertion, and AI interpretation remain future work.

@@ -1,6 +1,6 @@
 package com.fitlake.user.application
 
-import com.fitlake.user.application.port.TransactionExecutor
+import com.fitlake.shared.application.TransactionExecutor
 import com.fitlake.user.application.port.UserAccountRepository
 import com.fitlake.user.application.port.UserAuthIdentityRepository
 import com.fitlake.user.domain.UserAccount
