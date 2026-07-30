@@ -15,6 +15,7 @@ import com.fitlake.user.domain.UserId
 import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.stereotype.Repository
 import java.time.LocalDate
+import java.util.UUID
 
 @Repository
 class JpaDailyDayRepository(
@@ -47,6 +48,12 @@ class JpaDailyCaptureRepository(
 ) : DailyCaptureRepository {
 	override fun findById(captureId: DailyCaptureId): DailyCapture? =
 		repository.findById(captureId.value).orElse(null)?.let(mapper::toDomain)
+
+	override fun findByIdForUpdate(captureId: DailyCaptureId): DailyCapture? =
+		repository.findByCaptureIdForUpdate(captureId.value)?.let(mapper::toDomain)
+
+	override fun findBySourceEventId(sourceEventId: UUID): DailyCapture? =
+		repository.findBySourceEventId(sourceEventId)?.let(mapper::toDomain)
 
 	override fun findAllByUserIdAndDayId(userId: UserId, dayId: DailyDayId): List<DailyCapture> =
 		repository.findAllByUserIdAndDayIdOrderByCreatedAtAscCaptureIdAsc(userId.value, dayId.value)

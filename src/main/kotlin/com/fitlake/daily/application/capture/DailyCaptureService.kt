@@ -7,12 +7,15 @@ import com.fitlake.daily.application.port.DailyCaptureRepository
 import com.fitlake.daily.application.port.DailyDayRepository
 import com.fitlake.daily.domain.capture.DailyCapture
 import com.fitlake.daily.domain.capture.DailyCaptureId
+import com.fitlake.daily.domain.capture.DailyCapturePayload
 import com.fitlake.daily.domain.common.DailyDay
 import com.fitlake.shared.application.TransactionExecutor
 import com.fitlake.user.domain.UserId
 import org.springframework.stereotype.Service
+import java.math.BigDecimal
 import java.time.Clock
 import java.time.LocalDate
+import java.util.UUID
 
 @Service
 class DailyCaptureService(
@@ -25,9 +28,32 @@ class DailyCaptureService(
 	fun create(userId: UserId, date: LocalDate, input: DailyCaptureInput): DailyCapture {
 		val payload = payloadFactory.create(input)
 		return try {
-			transactionExecutor.required { createOnce(userId, date, payload) }
+			transactionExecutor.required { createUserCaptureOnce(userId, date, payload) }
 		} catch (exception: DailyConcurrentCreationException) {
-			transactionExecutor.required { createOnce(userId, date, payload) }
+			transactionExecutor.required { createUserCaptureOnce(userId, date, payload) }
+		}
+	}
+
+	fun createFromAi(
+		userId: UserId,
+		date: LocalDate,
+		input: DailyCaptureInput,
+		sourceEventId: UUID,
+		confidence: BigDecimal?,
+	): DailyCapture {
+		val payload = payloadFactory.create(input)
+		return transactionExecutor.required {
+			val day = requireEditableDay(userId, date)
+			captureRepository.save(
+				DailyCapture.openFromAi(
+					userId = userId,
+					dayId = day.dayId,
+					sourceEventId = sourceEventId,
+					payload = payload,
+					confidence = confidence,
+					at = clock.instant(),
+				),
+			)
 		}
 	}
 
@@ -40,17 +66,34 @@ class DailyCaptureService(
 		return capture
 	}
 
-	private fun createOnce(
+	private fun createUserCaptureOnce(
 		userId: UserId,
 		date: LocalDate,
-		payload: com.fitlake.daily.domain.capture.DailyCapturePayload,
+		payload: DailyCapturePayload,
 	): DailyCapture {
+		val day = findOrCreateEditableDay(userId, date)
+		val now = clock.instant()
+		return captureRepository.save(DailyCapture.openFromUser(userId, day.dayId, payload, now))
+	}
+
+	private fun findOrCreateEditableDay(userId: UserId, date: LocalDate): DailyDay {
 		val now = clock.instant()
 		val day = dayRepository.findByUserIdAndDateForUpdate(userId, date)
 			?: dayRepository.save(DailyDay.open(userId, date, now))
+		ensureEditable(day)
+		return day
+	}
+
+	private fun requireEditableDay(userId: UserId, date: LocalDate): DailyDay {
+		val day = dayRepository.findByUserIdAndDateForUpdate(userId, date)
+			?: throw DailyNotFoundException.day(date)
+		ensureEditable(day)
+		return day
+	}
+
+	private fun ensureEditable(day: DailyDay) {
 		if (day.status == com.fitlake.daily.domain.common.DailyDayStatus.CONFIRMED) {
 			throw DailyConflictException("Confirmed day cannot receive new captures")
 		}
-		return captureRepository.save(DailyCapture.openFromUser(userId, day.dayId, payload, now))
 	}
 }

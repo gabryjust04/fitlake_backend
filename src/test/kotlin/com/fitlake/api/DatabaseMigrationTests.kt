@@ -3,6 +3,7 @@ package com.fitlake.api
 import org.junit.jupiter.api.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class DatabaseMigrationTests {
 
@@ -46,9 +47,27 @@ class DatabaseMigrationTests {
 				.toSet(),
 		)
 		assertFalse(migration.contains("CREATE TABLE daily_", ignoreCase = true))
-		kotlin.test.assertTrue(migration.contains("UNIQUE (issuer, external_subject)"))
-		kotlin.test.assertTrue(migration.contains("UNIQUE (user_id, issuer)"))
-		kotlin.test.assertTrue(migration.contains("DROP CONSTRAINT uq_user_account_email"))
+		assertTrue(migration.contains("UNIQUE (issuer, external_subject)"))
+		assertTrue(migration.contains("UNIQUE (user_id, issuer)"))
+		assertTrue(migration.contains("DROP CONSTRAINT uq_user_account_email"))
+	}
+
+	@Test
+	fun `Daily AI migration adds audit linkage and database idempotency without new tables`() {
+		val migration = DatabaseMigrationTests::class.java
+			.getResourceAsStream("/db/migration/V3__add_daily_ai_message_audit.sql")
+			.use { requireNotNull(it).bufferedReader().readText() }
+
+		assertFalse(migration.contains("CREATE TABLE", ignoreCase = true))
+		assertTrue(migration.contains("ADD COLUMN replaces_capture_id UUID", ignoreCase = true))
+		assertTrue(migration.contains("ADD COLUMN processing_started_at TIMESTAMPTZ", ignoreCase = true))
+		assertTrue(migration.contains("ADD COLUMN processing_attempt_id UUID", ignoreCase = true))
+		assertTrue(migration.contains("ALTER COLUMN processing_started_at SET NOT NULL", ignoreCase = true))
+		assertTrue(migration.contains("ALTER COLUMN processing_attempt_id SET NOT NULL", ignoreCase = true))
+		assertTrue(migration.contains("(user_id, channel, source_message_id)", ignoreCase = true))
+		assertTrue(migration.contains("uq_daily_capture_source_event", ignoreCase = true))
+		assertTrue(migration.contains("uq_ai_interpretation_log_inbox_event", ignoreCase = true))
+		assertTrue(migration.contains("'NO_OP'"))
 	}
 
 }

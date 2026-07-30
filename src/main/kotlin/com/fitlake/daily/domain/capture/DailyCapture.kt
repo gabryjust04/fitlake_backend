@@ -71,6 +71,16 @@ data class DailyCapture(
 		)
 	}
 
+	fun replaceByReprocess(at: Instant): DailyCapture {
+		check(status == DailyCaptureStatus.OPEN) { "Only an open capture can be replaced" }
+		return copy(
+			status = DailyCaptureStatus.REJECTED,
+			rejectedAt = at,
+			updatedBy = DailyCaptureActor.SYSTEM,
+			updatedAt = maxOf(updatedAt, at),
+		)
+	}
+
 	fun replacePayload(newPayload: DailyCapturePayload, at: Instant): DailyCapture {
 		check(status == DailyCaptureStatus.OPEN || status == DailyCaptureStatus.ACCEPTED) {
 			"Only open or accepted captures can be edited"
@@ -114,6 +124,33 @@ data class DailyCapture(
 			payload = payload,
 			confidence = null,
 			createdBy = DailyCaptureActor.USER_UI,
+			updatedBy = null,
+			acceptedAt = null,
+			rejectedAt = null,
+			deletedAt = null,
+			expiredAt = null,
+			createdAt = at,
+			updatedAt = at,
+			version = 0,
+		)
+
+		fun openFromAi(
+			userId: UserId,
+			dayId: DailyDayId,
+			sourceEventId: UUID,
+			payload: DailyCapturePayload,
+			confidence: BigDecimal?,
+			at: Instant,
+		): DailyCapture = DailyCapture(
+			captureId = DailyCaptureId(UUID.randomUUID()),
+			userId = userId,
+			dayId = dayId,
+			sourceEventId = sourceEventId,
+			captureType = payload.type,
+			status = DailyCaptureStatus.OPEN,
+			payload = payload,
+			confidence = confidence,
+			createdBy = DailyCaptureActor.AI,
 			updatedBy = null,
 			acceptedAt = null,
 			rejectedAt = null,

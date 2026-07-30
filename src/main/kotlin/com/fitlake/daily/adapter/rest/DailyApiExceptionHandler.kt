@@ -5,13 +5,26 @@ import com.fitlake.daily.application.DailyConflictException
 import com.fitlake.daily.application.DailyNotFoundException
 import com.fitlake.daily.application.DailyStateCorruptionException
 import com.fitlake.daily.application.DailyValidationException
+import com.fitlake.daily.application.ai.DailyAiConfigurationException
+import com.fitlake.daily.application.ai.DailyAiException
+import com.fitlake.daily.application.ai.DailyAiIdempotencyConflictException
+import com.fitlake.daily.application.ai.DailyAiInvalidOutputException
+import com.fitlake.daily.application.ai.DailyAiOperationInProgressException
+import com.fitlake.daily.application.ai.DailyAiPersistenceException
+import com.fitlake.daily.application.ai.DailyAiProviderUnavailableException
+import com.fitlake.daily.application.ai.DailyAiRecordedFailureException
+import com.fitlake.daily.application.ai.DailyAiTimeoutException
+import jakarta.validation.ConstraintViolationException
 import org.springframework.dao.OptimisticLockingFailureException
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.http.converter.HttpMessageNotReadableException
+import org.springframework.web.bind.MissingRequestHeaderException
 import org.springframework.web.bind.MethodArgumentNotValidException
 import org.springframework.web.bind.annotation.ExceptionHandler
 import org.springframework.web.bind.annotation.RestControllerAdvice
+import org.springframework.web.method.annotation.HandlerMethodValidationException
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException
 
 data class DailyApiError(
 	val error: String,
@@ -37,6 +50,35 @@ class DailyApiExceptionHandler {
 	fun validation(exception: DailyValidationException): ResponseEntity<DailyApiError> =
 		response(HttpStatus.BAD_REQUEST, "validation_error", exception.message ?: "Invalid daily payload")
 
+	@ExceptionHandler(
+		DailyAiIdempotencyConflictException::class,
+		DailyAiOperationInProgressException::class,
+	)
+	fun aiConflict(exception: DailyAiException): ResponseEntity<DailyApiError> =
+		response(HttpStatus.CONFLICT, exception.errorCode.lowercase(), exception.safeMessage)
+
+	@ExceptionHandler(DailyAiInvalidOutputException::class)
+	fun invalidAiOutput(exception: DailyAiInvalidOutputException): ResponseEntity<DailyApiError> =
+		response(HttpStatus.BAD_GATEWAY, "ai_invalid_output", exception.safeMessage)
+
+	@ExceptionHandler(
+		DailyAiConfigurationException::class,
+		DailyAiProviderUnavailableException::class,
+	)
+	fun aiUnavailable(exception: DailyAiException): ResponseEntity<DailyApiError> =
+		response(HttpStatus.SERVICE_UNAVAILABLE, exception.errorCode.lowercase(), exception.safeMessage)
+
+	@ExceptionHandler(DailyAiTimeoutException::class)
+	fun aiTimeout(exception: DailyAiTimeoutException): ResponseEntity<DailyApiError> =
+		response(HttpStatus.GATEWAY_TIMEOUT, "ai_timeout", exception.safeMessage)
+
+	@ExceptionHandler(
+		DailyAiPersistenceException::class,
+		DailyAiRecordedFailureException::class,
+	)
+	fun aiInternalFailure(): ResponseEntity<DailyApiError> =
+		response(HttpStatus.INTERNAL_SERVER_ERROR, "internal_server_error", "Daily AI processing failed")
+
 	@ExceptionHandler(MethodArgumentNotValidException::class)
 	fun beanValidation(exception: MethodArgumentNotValidException): ResponseEntity<DailyApiError> {
 		val fields = exception.bindingResult.fieldErrors.associate { error ->
@@ -50,6 +92,15 @@ class DailyApiExceptionHandler {
 	@ExceptionHandler(HttpMessageNotReadableException::class)
 	fun unreadableRequest(): ResponseEntity<DailyApiError> =
 		response(HttpStatus.BAD_REQUEST, "invalid_request", "Request body is missing or malformed")
+
+	@ExceptionHandler(
+		MissingRequestHeaderException::class,
+		ConstraintViolationException::class,
+		HandlerMethodValidationException::class,
+		MethodArgumentTypeMismatchException::class,
+	)
+	fun invalidRequest(): ResponseEntity<DailyApiError> =
+		response(HttpStatus.BAD_REQUEST, "invalid_request", "Request parameters are missing or invalid")
 
 	@ExceptionHandler(DailyStateCorruptionException::class)
 	fun corruptedState(): ResponseEntity<DailyApiError> =

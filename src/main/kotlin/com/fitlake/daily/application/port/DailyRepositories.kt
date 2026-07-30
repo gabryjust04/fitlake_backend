@@ -19,6 +19,8 @@ interface DailyDayRepository {
 
 interface DailyCaptureRepository {
 	fun findById(captureId: DailyCaptureId): DailyCapture?
+	fun findByIdForUpdate(captureId: DailyCaptureId): DailyCapture?
+	fun findBySourceEventId(sourceEventId: java.util.UUID): DailyCapture?
 	fun findAllByUserIdAndDayId(userId: UserId, dayId: DailyDayId): List<DailyCapture>
 	fun findAllByUserIdAndDayIdAndStatus(
 		userId: UserId,

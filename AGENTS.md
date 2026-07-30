@@ -168,17 +168,19 @@ User clicks "Chiudi giornata" or says "ok giornata finita"
 
 ---
 
-## Current REST-Only Daily Slice
+## Current REST Daily Slice
 
-The current implemented Daily channel is authenticated REST only. Do not require or create Telegram, AI, inbox-event, or AI-log records for precise REST actions.
+The current implemented Daily channel is authenticated REST. Precise manual REST actions do not create AI, inbox-event, or AI-log records. Natural-language REST actions use the dedicated audited AI flow below.
 
 REST routes:
 
 ```text
 POST   /api/daily/days/{date}/captures
+POST   /api/daily/days/{date}/messages
 GET    /api/daily/days/{date}
 POST   /api/daily/captures/{captureId}/accept
 POST   /api/daily/captures/{captureId}/reject
+POST   /api/daily/captures/{captureId}/reprocess
 PUT    /api/daily/captures/{captureId}
 PATCH  /api/daily/captures/{captureId}/food-items/{itemTempId}
 DELETE /api/daily/captures/{captureId}
@@ -201,6 +203,14 @@ Important REST rules:
 * Food logs concatenate meals; provided calories and macros are summed.
 * Finalization is idempotent and returns the existing snapshot for an already confirmed day.
 * REST validation errors return `400`, missing resources return `404`, and invalid state transitions return `409`.
+* `POST /days/{date}/messages` and `POST /captures/{captureId}/reprocess` require an `Idempotency-Key` header.
+* One idempotency key represents one normalized complete text and terminal result. Reuse with different text is a conflict.
+* The AI endpoint accepts only `{ "text": "..." }`; structured capture JSON belongs to the manual endpoint.
+* A new AI message creates at most one ordinary `OPEN` capture with `created_by = AI` and a backend-owned source event.
+* Reprocess accepts only complete replacement text for an owned `OPEN` capture on an editable day.
+* Successful reprocess creates a distinct `OPEN` capture and atomically rejects the old proposal as `SYSTEM`.
+* Failed, invalid, clarification, or no-op reprocess leaves the old capture `OPEN` and unchanged.
+* There is no conversation memory or relative AI edit flow.
 
 ---
 
@@ -240,7 +250,7 @@ ASK_CLARIFICATION
 NO_OP
 ```
 
-Do not add AI correction/modification flows unless explicitly requested.
+The only supported AI correction is complete-text reprocess of an `OPEN` proposal. Do not add relative, conversational, accepted-capture, or agentic AI modification flows unless explicitly requested.
 
 ---
 
@@ -538,18 +548,21 @@ transcript_text TEXT nullable
 normalized_text TEXT nullable
 raw_payload JSONB nullable
 processing_status VARCHAR
+processing_started_at TIMESTAMPTZ
+processing_attempt_id UUID
 error_code VARCHAR nullable
 error_message TEXT nullable
 received_at TIMESTAMPTZ
 processed_at TIMESTAMPTZ nullable
 created_at TIMESTAMPTZ
+replaces_capture_id UUID FK daily_capture nullable
 ```
 
 Recommended indexes:
 
 ```text
 (user_id, received_at DESC)
-UNIQUE(channel, source_message_id) WHERE source_message_id IS NOT NULL
+UNIQUE(user_id, channel, source_message_id) WHERE source_message_id IS NOT NULL
 ```
 
 Allowed source types:
@@ -560,6 +573,13 @@ VOICE_MESSAGE
 CALLBACK
 MOBILE_AI_INPUT
 MOBILE_UI_ACTION
+```
+
+Current REST AI channels:
+
+```text
+REST_AI_MESSAGE
+REST_AI_REPROCESS
 ```
 
 Allowed processing statuses:
@@ -584,6 +604,10 @@ Important rules:
 
 * Save the inbox event before calling AI.
 * Do not lose the raw input.
+* Use `processing_started_at` as a renewable processing lease so a crashed request does not reserve an idempotency key forever.
+* Use `processing_attempt_id` as the fencing token. A worker may commit or record failure only while its attempt still owns the current lease.
+* A source event may create at most one capture; enforce this in PostgreSQL as well as application code.
+* `replaces_capture_id` is the single audit link from a reprocess event to the old proposal.
 * Do not put business state in this table.
 * This is an operational/audit table, not the final daily state.
 
@@ -863,6 +887,7 @@ SUCCESS
 FAILED
 INVALID_OUTPUT
 NEEDS_CLARIFICATION
+NO_OP
 ```
 
 Purpose:
@@ -876,6 +901,8 @@ Purpose:
 Important rules:
 
 * Do not store secrets in this table.
+* Store the immutable terminal result needed for idempotent replay; do not replay a later mutable state of the capture.
+* Do not store provider raw responses, chain of thought, Firebase tokens, API keys, prompts containing secrets, or credentials.
 * Do not rely on this table for business state.
 * Business state belongs to `daily_capture` and `daily_metrics`.
 
@@ -1190,6 +1217,10 @@ Transaction 2:
 - mark inbox event as PROCESSED
 ```
 
+For reprocess, the short terminal transaction must lock in the order `inbox event → day → previous capture`, create the new capture, reject the old proposal, write the terminal audit, and complete the event atomically. Never reject the old capture before the new one is valid and persisted.
+
+The network/model call always occurs outside a database transaction. A stale `PROCESSING` event may renew its lease and retry; database uniqueness on `source_event_id` remains the final duplicate-capture guard.
+
 Recommended finalization flow:
 
 ```text
@@ -1382,6 +1413,11 @@ Prioritize tests for:
 * invalid and expired Firebase tokens
 * public health and protected API endpoint policy
 * authentication identity uniqueness and persistence mapping
+* one terminal AI tool and defensive rejection of zero/multiple/unknown tools or free text
+* AI message idempotency, immutable replay, and stale-processing recovery
+* complete-text reprocess success and failure invariants
+* atomic replacement rollback and concurrent reprocess locking on PostgreSQL
+* no real AI provider, Firebase provider, network, or credentials in automated tests
 
 Recommended test style:
 
