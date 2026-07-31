@@ -1,6 +1,6 @@
 # FitLake API
 
-FitLake is a Spring Boot/Kotlin modular monolith for personal daily tracking. The current implementation contains Firebase Authentication, the authenticated Daily REST slice, and standalone natural-language insertion through Spring AI tool calling. Telegram is not implemented yet.
+FitLake is a Spring Boot/Kotlin modular monolith for personal daily tracking. The current implementation contains Firebase Authentication, the authenticated Daily REST slice, standalone natural-language insertion through Spring AI tool calling, and a private user-managed food catalog. Telegram is not implemented yet.
 
 ## Requirements
 
@@ -55,7 +55,9 @@ docker run --name fitlake-postgres `
   -d postgres:16-alpine
 ```
 
-Flyway runs automatically at application startup. `V1__initialize_fitlake_daily_schema.sql` creates the seven original Daily tables, `V2__add_firebase_auth_identity.sql` adds `user_auth_identity`, and `V3__add_daily_ai_message_audit.sql` adds the AI reprocess link, processing lease, and database idempotency constraints. Hibernate only validates the migrated schema (`ddl-auto=validate`).
+Flyway runs automatically at application startup. `V1__initialize_fitlake_daily_schema.sql` creates the seven original Daily tables, `V2__add_firebase_auth_identity.sql` adds `user_auth_identity`, `V3__add_daily_ai_message_audit.sql` adds the AI reprocess link, processing lease, and database idempotency constraints, and `V4__add_private_user_food_catalog.sql` adds `user_food`, `user_food_alias`, and their search indexes. Hibernate only validates the migrated schema (`ddl-auto=validate`).
+
+V4 enables PostgreSQL's `pg_trgm` extension with `CREATE EXTENSION IF NOT EXISTS pg_trgm`. The PostgreSQL installation must provide that extension and the migration role must be allowed to enable it. The official PostgreSQL Docker images used by local development and Testcontainers include it.
 
 ## Firebase setup
 
@@ -139,6 +141,120 @@ http://localhost:8080/v3/api-docs
 ```
 
 To call protected endpoints from Swagger UI, click **Authorize** and paste the Firebase ID token. Swagger adds the `Bearer` prefix automatically, so paste only the token itself.
+
+## Private food catalog
+
+The food catalog stores reusable nutrition definitions created manually by the authenticated user. It is private and tenant-scoped: the backend obtains the owner from `CurrentUserProvider`, never from request data, and foreign or deleted foods behave as not found. Catalog operations do not call AI, do not create inbox/audit records, and do not create or modify Daily captures.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/me/foods` | Create a private food definition |
+| `GET` | `/api/me/foods?page=0&size=20&sort=NAME_ASC` | List active foods with pagination |
+| `GET` | `/api/me/foods/search?query=my%20yogurt&limit=10` | Search active foods with deterministic ranking |
+| `GET` | `/api/me/foods/{foodId}` | Read one owned active food |
+| `PATCH` | `/api/me/foods/{foodId}` | Replace the complete editable definition |
+| `DELETE` | `/api/me/foods/{foodId}` | Soft-delete a food and its active aliases from normal access |
+
+List size is limited to `1..100`; available sorts are `NAME_ASC`, `CREATED_AT_DESC`, and `UPDATED_AT_DESC`. Search accepts `2..200` searchable characters and a result limit of `1..50`.
+
+Supported units are `GRAM`, `KILOGRAM`, `MILLILITER`, `LITER`, `PIECE`, and `SERVING`. Nutrition is always expressed for an explicit `nutritionBasis`. An optional `defaultServing` is separate from that basis. Cross-category conversions are allowed only when the matching positive conversion is explicitly supplied through `gramsPerPiece`, `millilitersPerPiece`, `gramsPerServing`, or `millilitersPerServing`; no arbitrary conversion is inferred.
+
+Nutrients use decimal values and may include calories, protein, carbohydrates, fat, fiber, sugars, saturated fat, sodium, and salt. A `null` nutrient means **unknown**, never zero. Source types are `USER_ENTERED`, `PRODUCT_LABEL`, `EXTERNAL_DATABASE`, `AI_ESTIMATE`, and `IMPORTED`; these values are metadata only and do not trigger an external provider or AI call.
+
+Create a product-label food expressed per 100 grams with a 170-gram default serving:
+
+```powershell
+curl.exe -X POST "http://localhost:8080/api/me/foods" `
+  -H "Authorization: Bearer <FIREBASE_ID_TOKEN>" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "name":"My usual Greek yogurt",
+    "brand":"Example Brand",
+    "barcode":"1234567890123",
+    "description":"Copied from the breakfast yogurt label",
+    "aliases":["my yogurt","usual yogurt"],
+    "nutritionBasis":{"amount":100,"unit":"GRAM"},
+    "nutrients":{
+      "caloriesKcal":62,
+      "proteinGrams":9.5,
+      "carbohydratesGrams":4.1,
+      "fatGrams":0.2,
+      "fiberGrams":null,
+      "sugarsGrams":4.1,
+      "saturatedFatGrams":0.1,
+      "sodiumMilligrams":40,
+      "saltGrams":null
+    },
+    "defaultServing":{"amount":170,"unit":"GRAM"},
+    "conversions":{},
+    "source":{"type":"PRODUCT_LABEL","notes":"Copied manually from the package label"}
+  }'
+```
+
+Nutrition per piece is represented directly, for example:
+
+```json
+{
+  "name": "Homemade biscuit",
+  "aliases": ["my biscuit"],
+  "nutritionBasis": {"amount": 1, "unit": "PIECE"},
+  "nutrients": {
+    "caloriesKcal": 42,
+    "proteinGrams": 1.1,
+    "carbohydratesGrams": 6.8,
+    "fatGrams": 1.4
+  },
+  "defaultServing": {"amount": 2, "unit": "PIECE"},
+  "source": {"type": "USER_ENTERED"}
+}
+```
+
+`PATCH` intentionally uses full replacement semantics: send the same complete editable shape accepted by `POST`. Omitted optional fields become `null` or their documented empty default, and the supplied `aliases` array replaces every active alias. IDs, owner, normalized fields, timestamps, deletion state, and version are backend-owned. For example, replacing the aliases requires resending the nutrition definition:
+
+```http
+PATCH /api/me/foods/2db702d6-aeeb-46be-b863-72d552de63ab
+Authorization: Bearer <FIREBASE_ID_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "name": "My usual Greek yogurt",
+  "aliases": ["my yogurt", "breakfast yogurt"],
+  "nutritionBasis": {"amount": 100, "unit": "GRAM"},
+  "nutrients": {"caloriesKcal": 62, "proteinGrams": 9.5, "carbohydratesGrams": 4.1, "fatGrams": 0.2},
+  "defaultServing": {"amount": 170, "unit": "GRAM"},
+  "source": {"type": "PRODUCT_LABEL"}
+}
+```
+
+Search normalizes case, whitespace, punctuation, Unicode, and accents in the backend. Results are deduplicated per food and ordered by this fixed priority:
+
+```text
+EXACT_BARCODE
+> EXACT_ALIAS
+> EXACT_NAME
+> PREFIX_ALIAS
+> PREFIX_NAME
+> FUZZY_ALIAS
+> FUZZY_NAME
+```
+
+Prefix matching uses normalized indexed fields. Typo matching uses `pg_trgm` with a `0.30` similarity threshold and starts for normalized queries of at least three characters. Equal candidates are ordered deterministically by score, normalized name, and food ID. The response exposes `matchedBy`, `matchedText`, and `score`; this is conventional PostgreSQL search, not RAG, embeddings, semantic search, or an LLM call.
+
+```powershell
+curl.exe "http://localhost:8080/api/me/foods/search?query=my%20yogurth&limit=10" `
+  -H "Authorization: Bearer <FIREBASE_ID_TOKEN>"
+
+curl.exe -X DELETE "http://localhost:8080/api/me/foods/<FOOD_ID>" `
+  -H "Authorization: Bearer <FIREBASE_ID_TOKEN>"
+```
+
+Deletion sets `deleted_at` and returns `204`; the food and its aliases then disappear from direct reads, normal lists, and search. There is no restore endpoint in this MVP. Active barcodes and normalized aliases are unique per user, while the same values remain valid for different users and can be reused after soft deletion.
+
+Invalid definitions and query parameters return `400`, inaccessible foods return `404`, and active barcode or alias conflicts return `409`, using the API's standard safe error body.
+
+The catalog is deliberately not connected to Daily yet. When that integration is added, each consumed item must store both a `userFoodId` reference and an immutable snapshot of the food name, consumed amount/unit, nutrition values, and source used at that time. Later edits or deletion of the catalog definition must never rewrite historical Daily captures.
 
 ## Daily REST API
 
@@ -295,7 +411,7 @@ $env:JAVA_HOME='C:\path\to\jdk-25'
 .\gradlew.bat test
 ```
 
-The suite includes Daily domain/use-case tests, offline Spring AI tool-calling tests, authenticated REST tests, filter and MVC security tests with a fake token verifier, and PostgreSQL/Flyway/JSONB persistence, rollback, and concurrency tests through Testcontainers. No real Firebase or AI credentials and no provider network calls are used. PostgreSQL integration tests are skipped when Docker is unavailable.
+The suite includes Daily domain/use-case tests, offline Spring AI tool-calling tests, authenticated REST tests, private-food domain/CRUD/isolation/search tests, filter and MVC security tests with a fake token verifier, and PostgreSQL/Flyway/JSONB/`pg_trgm` persistence, rollback, and concurrency tests through Testcontainers. No real Firebase or AI credentials and no provider network calls are used. PostgreSQL integration tests are skipped when Docker is unavailable.
 
 ## Current deliberate limits
 
@@ -303,4 +419,6 @@ The suite includes Daily domain/use-case tests, offline Spring AI tool-calling t
 - One Firebase issuer may map to only one identity per internal user.
 - A Firebase email claim is stored even when unverified and is synchronized when it changes on later logins. A missing claim does not erase the stored value, and email is never used for account resolution or merging.
 - Display name seeds the profile on first login but later token changes do not overwrite user-managed profile data.
+- Personal foods are manually managed and private; automatic creation, barcode lookup, external nutrition lookup, and integration with AI or Daily captures are not implemented.
+- Soft-deleted personal foods cannot currently be restored through the API.
 - Account linking, account deletion, authorization roles, Telegram, conversational memory, relative AI edits, and AI-driven finalization remain future work.

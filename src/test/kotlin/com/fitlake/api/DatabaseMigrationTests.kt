@@ -70,4 +70,26 @@ class DatabaseMigrationTests {
 		assertTrue(migration.contains("'NO_OP'"))
 	}
 
+	@Test
+	fun `private food catalog migration creates only user food tables and trigram indexes`() {
+		val migration = DatabaseMigrationTests::class.java
+			.getResourceAsStream("/db/migration/V4__add_private_user_food_catalog.sql")
+			.use { requireNotNull(it).bufferedReader().readText() }
+
+		assertEquals(
+			setOf("user_food", "user_food_alias"),
+			Regex("(?im)^CREATE TABLE\\s+([a-z_][a-z0-9_]*)\\b")
+				.findAll(migration)
+				.map { it.groupValues[1] }
+				.toSet(),
+		)
+		assertTrue(migration.contains("CREATE EXTENSION IF NOT EXISTS pg_trgm", ignoreCase = true))
+		assertTrue(migration.contains("gin_trgm_ops", ignoreCase = true))
+		assertTrue(migration.contains("uq_user_food_active_barcode", ignoreCase = true))
+		assertTrue(migration.contains("uq_user_food_alias_active_normalized", ignoreCase = true))
+		assertTrue(migration.contains("FOREIGN KEY (user_food_id, user_id)", ignoreCase = true))
+		assertFalse(migration.contains("ALTER TABLE daily_", ignoreCase = true))
+		assertFalse(migration.contains("ALTER TABLE ai_", ignoreCase = true))
+	}
+
 }

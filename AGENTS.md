@@ -4,7 +4,7 @@
 
 FitLake is a personal daily tracking system.
 
-The current scope is the **Daily module only**.
+The primary product scope is the **Daily module**. The backend also contains a supporting private food-catalog module whose only current responsibility is manually managed reusable nutrition definitions. It is not yet connected to Daily captures or AI interpretation.
 
 The system tracks daily personal data such as:
 
@@ -126,6 +126,19 @@ Domain classes represent business concepts.
 
 Infrastructure implements external details such as JPA, PostgreSQL, Telegram, AI clients, and transcription providers.
 
+The food catalog is a sibling bounded module:
+
+```text
+food/
+├── adapter/rest/
+├── application/
+│   └── port/
+├── domain/
+└── infrastructure/persistence/
+```
+
+Its domain, application ports, REST DTOs, and persistence entities must remain separate from the Daily capture model.
+
 ---
 
 ## Current MVP Flow
@@ -214,6 +227,139 @@ Important REST rules:
 
 ---
 
+## Current Private Food Catalog Slice
+
+A user food is a reusable personal nutrition definition. It is not something consumed on a particular date.
+
+```text
+user food = reusable catalog definition
+daily capture = occurrence consumed on a date
+```
+
+The catalog is authenticated, private, manually managed, and independent from Daily and AI. Creating, reading, updating, deleting, listing, or searching a user food must not create or modify a `daily_day`, `daily_capture`, `daily_inbox_event`, or `ai_interpretation_log`, and must not call Spring AI or an external nutrition provider.
+
+REST routes:
+
+```text
+POST   /api/me/foods
+GET    /api/me/foods
+GET    /api/me/foods/search?query={query}
+GET    /api/me/foods/{foodId}
+PATCH  /api/me/foods/{foodId}
+DELETE /api/me/foods/{foodId}
+```
+
+Important catalog rules:
+
+* Controllers obtain the internal `UserId` only from `CurrentUserProvider`; no catalog request accepts a user ID.
+* Every repository read and write is scoped by both food ID and authenticated user ID where applicable.
+* A foreign-owned, deleted, or nonexistent food returns `404`, avoiding resource-existence disclosure.
+* Normal lists, direct reads, and search include active foods only.
+* `DELETE` is a soft delete. It sets a backend timestamp and removes the food and aliases from active lookup; it never touches Daily data.
+* There is no restore endpoint in this MVP. Repeated deletion therefore deterministically behaves as not found.
+* `PATCH` replaces the full editable definition accepted by `POST`; it is not a partial merge. The aliases array replaces all active aliases.
+* Food ID, owner, normalized text, creation timestamp, deletion timestamp, and persistence version are backend-owned.
+* List pagination defaults to page `0`, size `20`, and `NAME_ASC`; size is limited to `1..100`. Supported sorts are `NAME_ASC`, `CREATED_AT_DESC`, and `UPDATED_AT_DESC`.
+* Search limits are `2..200` normalized searchable characters and `1..50` results. Fuzzy matching begins at three normalized characters.
+* Invalid definitions or query parameters return the shared `400` error shape; duplicate active aliases/barcodes return `409`; persistence details and foreign ownership are never exposed.
+* Catalog logs may include event, internal user/food ID, result count, and duration, but not authorization data, full definitions, descriptions, source notes, or search text.
+
+The editable definition contains:
+
+```text
+name, optional brand/barcode/description, aliases
+nutrition basis amount + unit
+nullable nutrient values
+optional default serving amount + unit
+explicit piece/serving conversion metadata
+nutrition source metadata
+```
+
+Supported `FoodUnit` values:
+
+```text
+GRAM
+KILOGRAM
+MILLILITER
+LITER
+PIECE
+SERVING
+```
+
+Nutrition basis and default-serving amounts must be positive. Nutrients and conversions use `BigDecimal`, have defensive upper bounds, and cannot be negative. A missing nutrient is **unknown**, not zero. Never silently coerce a missing nutrient to zero.
+
+The default serving is independent from the nutrition basis. Mass-to-mass and volume-to-volume scaling is deterministic. Crossing between mass or volume and `PIECE`/`SERVING` requires the corresponding explicit conversion metadata:
+
+```text
+gramsPerPiece
+millilitersPerPiece
+gramsPerServing
+millilitersPerServing
+```
+
+A piece or serving cannot simultaneously define both a mass and volume conversion. Do not perform arbitrary conversions or infer them from names.
+
+Supported nutrition-source types are:
+
+```text
+USER_ENTERED
+PRODUCT_LABEL
+EXTERNAL_DATABASE
+AI_ESTIMATE
+IMPORTED
+```
+
+They are provenance metadata only. `EXTERNAL_DATABASE` requires provider and external ID metadata, but the catalog does not contact that provider. `AI_ESTIMATE` marks existing entered values as estimated; it does not authorize an AI call.
+
+Example product-label definition:
+
+```json
+{
+  "name": "My usual Greek yogurt",
+  "brand": "Example Brand",
+  "barcode": "1234567890123",
+  "aliases": ["my yogurt", "usual yogurt"],
+  "nutritionBasis": {"amount": 100, "unit": "GRAM"},
+  "nutrients": {
+    "caloriesKcal": 62,
+    "proteinGrams": 9.5,
+    "carbohydratesGrams": 4.1,
+    "fatGrams": 0.2,
+    "fiberGrams": null
+  },
+  "defaultServing": {"amount": 170, "unit": "GRAM"},
+  "conversions": {},
+  "source": {"type": "PRODUCT_LABEL", "notes": "Copied manually from the label"}
+}
+```
+
+Aliases and names are normalized centrally using Unicode decomposition, locale-safe lowercasing, accent removal, punctuation-to-space conversion, trimming, and whitespace collapse. Blank aliases, aliases duplicated after normalization within one definition, or an active normalized alias already owned by another active food of the same user are conflicts or validation errors. The same alias may belong to a different user. Active barcodes are likewise unique per user and reusable after deletion.
+
+Search is conventional PostgreSQL search, not RAG or semantic search. Each branch is scoped by authenticated `user_id` and `deleted_at IS NULL`, and candidates are deduplicated per food. Ranking priority is fixed:
+
+```text
+1. EXACT_BARCODE
+2. EXACT_ALIAS
+3. EXACT_NAME
+4. PREFIX_ALIAS
+5. PREFIX_NAME
+6. FUZZY_ALIAS
+7. FUZZY_NAME
+```
+
+Prefix matching uses normalized B-tree pattern indexes. Fuzzy name and alias matching use `pg_trgm` GIN indexes with a transaction-local similarity threshold of `0.30`. Within one rank, order by score descending and then stable normalized name/ID tie-breakers. Search responses may expose `matchedBy`, `matchedText`, and score, but controllers must not implement normalization or ranking.
+
+Future Daily integration must go through the application-level search use case, not the PostgreSQL adapter directly. For every consumed personal food, a future capture must preserve both:
+
+```text
+reference to userFoodId
++ immutable snapshot of name, consumed amount/unit, nutrition values, and nutrition source used at capture time
+```
+
+Updating or deleting a catalog definition must never rewrite historical capture nutrition. Do not implement this integration unless explicitly requested.
+
+---
+
 ## AI Usage Rules
 
 AI is used only to interpret natural language.
@@ -273,6 +419,14 @@ Domain concepts currently include:
 * `MealItemDraft`
 * `DailyMetrics`
 * `DailyState`
+* `UserFood`
+* `UserFoodId`
+* `FoodAliasValue`
+* `NutritionBasis`
+* `NutrientValues`
+* `DefaultServing`
+* `UnitConversions`
+* `NutritionSource`
 
 Application services should include:
 
@@ -284,6 +438,10 @@ Application services should include:
 * `CaptureConfirmationService`
 * `DailyFinalizationService`
 * `DailyMetricsProjectionService`
+* `UserFoodService`
+* `UserFoodSearchService`
+
+`SearchUserFoodsUseCase` is the future-facing application boundary for personal-food lookup. Daily and AI code must not depend on JPA repositories, JDBC queries, or `pg_trgm` details.
 
 Do not put business logic in controllers.
 
@@ -365,9 +523,13 @@ The MVP database contains these tables:
 6. daily_capture
 7. ai_interpretation_log
 8. daily_metrics
+9. user_food
+10. user_food_alias
 ```
 
-Do not introduce new database tables unless the task explicitly requires it.
+`user_food` and `user_food_alias` were explicitly introduced for the private manual catalog by Flyway V4. Do not introduce further database tables unless a task explicitly requires it.
+
+V4 also enables `pg_trgm`. Local and production PostgreSQL installations must provide this extension, and the Flyway role must be allowed to execute `CREATE EXTENSION IF NOT EXISTS pg_trgm`.
 
 For the MVP, do not create a separate `meal` or `meal_item` table.
 
@@ -401,6 +563,84 @@ Important rule:
 The user timezone is required for interpreting natural dates such as today, yesterday, this morning, and tonight.
 
 Email is profile data, not an authentication identifier. Do not restore a unique constraint on `user_account.email` and do not merge users by email.
+
+---
+
+## Table: user_food
+
+Stores one reusable private nutrition definition owned by an internal user.
+
+Core columns:
+
+```text
+user_food_id UUID PK
+user_id UUID FK user_account
+name VARCHAR
+normalized_name VARCHAR
+brand VARCHAR nullable
+barcode VARCHAR nullable
+description VARCHAR nullable
+basis_amount NUMERIC
+basis_unit VARCHAR
+calories_kcal NUMERIC nullable
+protein_grams NUMERIC nullable
+carbohydrates_grams NUMERIC nullable
+fat_grams NUMERIC nullable
+fiber_grams NUMERIC nullable
+sugars_grams NUMERIC nullable
+saturated_fat_grams NUMERIC nullable
+sodium_milligrams NUMERIC nullable
+salt_grams NUMERIC nullable
+default_serving_amount NUMERIC nullable
+default_serving_unit VARCHAR nullable
+grams_per_piece NUMERIC nullable
+milliliters_per_piece NUMERIC nullable
+grams_per_serving NUMERIC nullable
+milliliters_per_serving NUMERIC nullable
+source_type VARCHAR
+source_provider VARCHAR nullable
+source_external_id VARCHAR nullable
+source_notes VARCHAR nullable
+source_copied_at DATE nullable
+created_at TIMESTAMPTZ
+updated_at TIMESTAMPTZ
+deleted_at TIMESTAMPTZ nullable
+version BIGINT
+```
+
+Important database rules:
+
+* Numeric and unit invariants are protected by PostgreSQL check constraints as a second line of defense after domain validation.
+* The pair `(user_food_id, user_id)` is unique so aliases can use a composite owner-preserving foreign key.
+* Active non-null barcode is unique by `(user_id, barcode)`, not globally.
+* Partial B-tree indexes support active user-scoped list sorts and prefix lookup.
+* A partial GIN `gin_trgm_ops` index supports active normalized-name fuzzy lookup.
+* Soft-deleted rows remain available for future historical references but are absent from current APIs.
+
+---
+
+## Table: user_food_alias
+
+Stores searchable aliases belonging to one private food and repeats `user_id` to make tenant ownership enforceable in the foreign key and indexes.
+
+Expected columns:
+
+```text
+alias_id UUID PK
+user_food_id UUID
+user_id UUID
+alias VARCHAR
+normalized_alias VARCHAR
+created_at TIMESTAMPTZ
+deleted_at TIMESTAMPTZ nullable
+```
+
+Important database rules:
+
+* `(user_food_id, user_id)` references the same pair on `user_food`.
+* Active normalized alias is unique by `(user_id, normalized_alias)` across the user's active foods.
+* Partial prefix and `gin_trgm_ops` indexes support active alias search.
+* Replacing aliases soft-deletes removed alias rows; deleting a food removes all of its aliases from active lookup.
 
 ---
 
@@ -1191,6 +1431,19 @@ Minimum validations:
 * field value type is correct
 * day is not finalized unless the use case allows reopening/recalculation
 
+For the private food catalog also validate:
+
+* authenticated user owns every accessed food
+* name and aliases satisfy length and nonblank limits
+* aliases are unique after centralized normalization
+* barcode contains 8 to 14 digits when present
+* nutrition basis and default-serving amounts are positive
+* nutrients are nullable or nonnegative decimal values within the defensive maximum
+* conversion values are positive and do not define both mass and volume for one piece/serving
+* the nutrition-basis/default-serving unit pair is deterministic or has explicit conversion metadata
+* nutrition-source provider/external-ID consistency
+* list pagination, sort allowlist, search length, and search limit
+
 Do not trust client-side validation.
 
 Do not trust AI validation.
@@ -1236,6 +1489,9 @@ Use optimistic locking on:
 
 * `daily_day`
 * `daily_capture`
+* `user_food`
+
+Catalog CRUD and search must use the shared transaction abstraction. PostgreSQL's transaction-local `pg_trgm` threshold must be set and consumed inside the same search transaction.
 
 ---
 
@@ -1258,6 +1514,8 @@ Controllers must not:
 * contain aggregation logic
 * edit JSON payloads directly
 * decide business transitions
+* normalize food names or aliases
+* implement personal-food ranking or query persistence adapters directly
 
 ---
 
@@ -1347,6 +1605,10 @@ CaptureConfirmationService
 DailyFinalizationService
 AiCaptureInterpreterService
 DailyMetricsProjectionService
+UserFood
+UserFoodService
+UserFoodSearchService
+SearchUserFoodsUseCase
 ```
 
 Avoid misleading names such as:
@@ -1386,6 +1648,18 @@ Never skip backend validation because the AI output seems correct.
 
 Never introduce correction/modification AI flows unless explicitly requested.
 
+Never create a Daily capture as a side effect of personal-food CRUD or search.
+
+Never call AI, an external nutrition API, embeddings, a vector store, or RAG from personal-food CRUD or search.
+
+Never accept a catalog owner ID, normalized name/alias, deletion timestamp, or persistence version from a client.
+
+Never treat a missing catalog nutrient as zero.
+
+Never convert between mass/volume and piece/serving without explicit conversion metadata.
+
+Never update historical Daily data when a catalog definition changes or is soft-deleted.
+
 ---
 
 ## Testing Expectations
@@ -1417,6 +1691,14 @@ Prioritize tests for:
 * AI message idempotency, immutable replay, and stale-processing recovery
 * complete-text reprocess success and failure invariants
 * atomic replacement rollback and concurrent reprocess locking on PostgreSQL
+* private-food creation, backend-generated identity, retrieval, full-definition replacement, and soft deletion
+* private-food domain validation for basis, nutrients, aliases, barcode, serving, conversions, and source metadata
+* authenticated user isolation for private-food read, update, delete, list, uniqueness, and search
+* alias replacement and normalized-name recomputation
+* pagination boundaries and stable list ordering
+* exact barcode, exact alias/name, alias/name prefix, and alias/name typo ranking order
+* deterministic search result limiting, deduplication, deletion filtering, and user scoping
+* `pg_trgm` migration, indexes, decimal round-trip, alias persistence, and database constraints on PostgreSQL
 * no real AI provider, Firebase provider, network, or credentials in automated tests
 
 Recommended test style:
@@ -1442,5 +1724,9 @@ A task is done only when:
 * new tables or columns are documented
 * authenticated use cases depend on the internal `UserId`, not Firebase SDK types
 * authentication tests do not require real provider credentials
+* personal-food endpoints remain manual, private, and independent from Daily and AI
+* personal-food nutrients preserve unknown values as null and use decimal-safe types
+* personal-food search remains user-scoped, deterministic, and backed by the V4 PostgreSQL indexes
+* future Daily integration preserves an immutable nutrition snapshot rather than reading mutable catalog values as history
 * Telegram and mobile flows still use shared backend services
 * daily finalization remains deterministic
