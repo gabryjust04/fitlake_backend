@@ -7,6 +7,7 @@ import com.fitlake.daily.application.port.DailyCaptureRepository
 import com.fitlake.daily.application.port.DailyDayRepository
 import com.fitlake.daily.application.port.DailyMetricsRepository
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
+import com.fitlake.daily.domain.common.DailyDay
 import com.fitlake.daily.domain.common.DailyDayStatus
 import com.fitlake.daily.domain.metrics.DailyMetrics
 import com.fitlake.shared.application.TransactionExecutor
@@ -27,10 +28,15 @@ class DailyFinalizationService(
 	fun finalizeDay(userId: UserId, date: LocalDate): DailyMetrics = transactionExecutor.required {
 		val day = dayRepository.findByUserIdAndDateForUpdate(userId, date)
 			?: throw DailyNotFoundException.day(date)
+		val existingMetrics = metricsRepository.findByDayId(day.dayId)
 
 		if (day.status == DailyDayStatus.CONFIRMED) {
-			return@required metricsRepository.findByDayId(day.dayId)
-				?: throw DailyStateCorruptionException("Confirmed day has no metrics snapshot")
+			return@required requireConsistentMetrics(day, existingMetrics, DailyDayStatus.CONFIRMED)
+		}
+		if (day.status == DailyDayStatus.REOPENED) {
+			requireConsistentMetrics(day, existingMetrics, DailyDayStatus.REOPENED)
+		} else if (existingMetrics != null) {
+			throw DailyStateCorruptionException("Open day unexpectedly has a metrics snapshot")
 		}
 
 		if (
@@ -52,12 +58,31 @@ class DailyFinalizationService(
 		val metrics = projectionService.project(
 			day = day,
 			captures = accepted,
-			existing = metricsRepository.findByDayId(day.dayId),
+			existing = existingMetrics,
 			at = now,
 		)
 
 		val savedMetrics = metricsRepository.save(metrics)
 		dayRepository.save(day.confirm(now))
 		savedMetrics
+	}
+
+	private fun requireConsistentMetrics(
+		day: DailyDay,
+		metrics: DailyMetrics?,
+		expectedStatus: DailyDayStatus,
+	): DailyMetrics {
+		val snapshot = metrics
+			?: throw DailyStateCorruptionException("${day.status} day has no metrics snapshot")
+		if (
+			snapshot.dayId != day.dayId ||
+			snapshot.userId != day.userId ||
+			snapshot.dayDate != day.dayDate ||
+			snapshot.status != expectedStatus ||
+			snapshot.confirmedAt == null
+		) {
+			throw DailyStateCorruptionException("${day.status} day has an inconsistent metrics snapshot")
+		}
+		return snapshot
 	}
 }

@@ -21,28 +21,22 @@ import java.util.UUID
 class DailyCaptureService(
 	private val dayRepository: DailyDayRepository,
 	private val captureRepository: DailyCaptureRepository,
-	private val payloadFactory: DailyPayloadFactory,
 	private val transactionExecutor: TransactionExecutor,
 	private val clock: Clock,
 ) {
-	fun create(userId: UserId, date: LocalDate, input: DailyCaptureInput): DailyCapture {
-		val payload = payloadFactory.create(input)
-		return try {
-			transactionExecutor.required { createUserCaptureOnce(userId, date, payload) }
-		} catch (exception: DailyConcurrentCreationException) {
-			transactionExecutor.required { createUserCaptureOnce(userId, date, payload) }
-		}
+	fun createFromUser(userId: UserId, date: LocalDate, payload: DailyCapturePayload): DailyCapture = try {
+		transactionExecutor.required { createUserCaptureOnce(userId, date, payload) }
+	} catch (exception: DailyConcurrentCreationException) {
+		transactionExecutor.required { createUserCaptureOnce(userId, date, payload) }
 	}
 
 	fun createFromAi(
 		userId: UserId,
 		date: LocalDate,
-		input: DailyCaptureInput,
+		payload: DailyCapturePayload,
 		sourceEventId: UUID,
 		confidence: BigDecimal?,
-	): DailyCapture {
-		val payload = payloadFactory.create(input)
-		return transactionExecutor.required {
+	): DailyCapture = transactionExecutor.required {
 			val day = requireEditableDay(userId, date)
 			captureRepository.save(
 				DailyCapture.openFromAi(
@@ -54,16 +48,11 @@ class DailyCaptureService(
 					at = clock.instant(),
 				),
 			)
-		}
 	}
 
 	fun requireOwned(userId: UserId, captureId: DailyCaptureId): DailyCapture {
-		val capture = captureRepository.findById(captureId)
+		return captureRepository.findByIdAndUserId(captureId, userId)
 			?: throw DailyNotFoundException.capture(captureId.value)
-		if (capture.userId != userId) {
-			throw DailyNotFoundException.capture(captureId.value)
-		}
-		return capture
 	}
 
 	private fun createUserCaptureOnce(
@@ -72,14 +61,12 @@ class DailyCaptureService(
 		payload: DailyCapturePayload,
 	): DailyCapture {
 		val day = findOrCreateEditableDay(userId, date)
-		val now = clock.instant()
-		return captureRepository.save(DailyCapture.openFromUser(userId, day.dayId, payload, now))
+		return captureRepository.save(DailyCapture.openFromUser(userId, day.dayId, payload, clock.instant()))
 	}
 
 	private fun findOrCreateEditableDay(userId: UserId, date: LocalDate): DailyDay {
-		val now = clock.instant()
 		val day = dayRepository.findByUserIdAndDateForUpdate(userId, date)
-			?: dayRepository.save(DailyDay.open(userId, date, now))
+			?: dayRepository.save(DailyDay.open(userId, date, clock.instant()))
 		ensureEditable(day)
 		return day
 	}

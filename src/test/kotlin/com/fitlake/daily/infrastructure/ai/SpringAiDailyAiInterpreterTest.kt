@@ -1,6 +1,8 @@
 package com.fitlake.daily.infrastructure.ai
 
 import com.fitlake.daily.application.ai.AiCaptureProposal
+import com.fitlake.daily.application.ai.AiFoodItemProposal
+import com.fitlake.daily.application.ai.AiMealProposal
 import com.fitlake.daily.application.ai.DailyAiInvalidOutputException
 import com.fitlake.daily.application.ai.DailyAiPersistenceException
 import com.fitlake.daily.application.ai.DailyAiProviderMetadata
@@ -11,8 +13,9 @@ import com.fitlake.daily.application.ai.DailyAiTerminalService
 import com.fitlake.daily.application.ai.DailyAiTimeoutException
 import com.fitlake.daily.application.ai.toAiCaptureResult
 import com.fitlake.daily.domain.capture.DailyCapture
+import com.fitlake.daily.domain.capture.DailyCaptureEntry
+import com.fitlake.daily.domain.capture.DailyCaptureEntryType
 import com.fitlake.daily.domain.capture.DailyCapturePayload
-import com.fitlake.daily.domain.capture.DailyCaptureType
 import com.fitlake.daily.domain.common.DailyDayId
 import com.fitlake.daily.domain.inbox.DailyInboxEventId
 import com.fitlake.user.domain.UserId
@@ -37,8 +40,10 @@ import org.springframework.ai.tool.definition.ToolDefinition
 import org.springframework.ai.util.JsonHelper
 import org.springframework.boot.test.system.CapturedOutput
 import org.springframework.boot.test.system.OutputCaptureExtension
+import org.springframework.core.io.DefaultResourceLoader
 import java.math.BigDecimal
 import java.net.SocketTimeoutException
+import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -82,6 +87,42 @@ class SpringAiDailyAiInterpreterTest {
 		assertSame(expected, actual)
 		verify(terminalService).createCapture(context, expectedProposal)
 		assertEquals(1, chatModel.callCount)
+	}
+
+	@Test
+	fun `complete food nutrition estimates bind as decimals and reach the terminal service`() {
+		val expected = captureCreatedResult()
+		val expectedProposal = AiCaptureProposal(
+			type = "FOOD",
+			meals = listOf(
+				AiMealProposal(
+					mealName = "pranzo",
+					items = listOf(
+						AiFoodItemProposal(
+							foodName = "pollo",
+							quantity = BigDecimal("100"),
+							unit = "g",
+							calories = BigDecimal("165.25"),
+							proteinG = BigDecimal("31.125"),
+							carbsG = BigDecimal.ZERO,
+							fatG = BigDecimal("3.6"),
+						),
+					),
+				),
+			),
+			confidence = BigDecimal("0.88"),
+		)
+		doReturn(expected).`when`(terminalService).createCapture(context, expectedProposal)
+		val interpreter = interpreter(
+			ScriptedChatModel {
+				toolResponse(toolCall("createCapture", VALID_FOOD_CREATE_CAPTURE_ARGUMENTS))
+			},
+		)
+
+		val actual = interpreter.interpret(context, "100 grammi di pollo")
+
+		assertSame(expected, actual)
+		verify(terminalService).createCapture(context, expectedProposal)
 	}
 
 	@Test
@@ -307,7 +348,39 @@ class SpringAiDailyAiInterpreterTest {
 			assertFalse(schemas.contains(forbidden, ignoreCase = true), "$forbidden leaked into a tool schema")
 		}
 		assertTrue(schemas.contains("foodName"))
+		assertTrue(schemas.contains("calories"))
+		assertTrue(schemas.contains("proteinG"))
+		assertTrue(schemas.contains("carbsG"))
+		assertTrue(schemas.contains("fatG"))
 		assertTrue(schemas.contains("sleepHours"))
+		val createCaptureSchema = JsonHelper().fromJsonToMap(
+			toolCallbacks.single { it.toolDefinition.name() == "createCapture" }.toolDefinition.inputSchema(),
+		)
+		val foodItemSchema = requireNotNull(findSchemaWithProperty(createCaptureSchema, "foodName"))
+		val requiredFoodItemFields = (foodItemSchema["required"] as? List<*>)
+			.orEmpty()
+			.filterIsInstance<String>()
+			.toSet()
+		assertTrue(
+			requiredFoodItemFields.containsAll(setOf("calories", "proteinG", "carbsG", "fatG")),
+			"Complete nutrition estimates must be required by the createCapture tool schema",
+		)
+	}
+
+	@Test
+	fun `v2 prompt requires a complete non-negative nutrition fallback for every food item`() {
+		assertEquals("daily-capture-v2", DAILY_AI_PROMPT_VERSION)
+		assertEquals("classpath:prompts/daily-capture-v2.txt", DAILY_AI_PROMPT_RESOURCE)
+		val prompt = DefaultResourceLoader()
+			.getResource(DAILY_AI_PROMPT_RESOURCE)
+			.getContentAsString(StandardCharsets.UTF_8)
+
+		assertTrue(prompt.contains("Every food item must include calories, proteinG, carbsG, and fatG"))
+		assertTrue(prompt.contains("All four values are required and must be numeric and non-negative"))
+		assertTrue(prompt.contains("complete consumed quantity"))
+		assertTrue(prompt.contains("backend fallback estimates"))
+		assertFalse(prompt.contains("Do not estimate calories or macronutrients"))
+		assertFalse(prompt.contains("Leave unknown nutrition values absent"))
 	}
 
 	private fun interpreter(
@@ -327,7 +400,9 @@ class SpringAiDailyAiInterpreterTest {
 			userId = context.userId,
 			dayId = DailyDayId(UUID.fromString("30000000-0000-0000-0000-000000000003")),
 			sourceEventId = context.inboxEventId.value,
-			payload = DailyCapturePayload(type = DailyCaptureType.NOTE, note = "Oggi mi sento bene"),
+			payload = DailyCapturePayload.fromEntries(
+				listOf(DailyCaptureEntry(UUID.randomUUID(), DailyCaptureEntryType.NOTE, text = "Oggi mi sento bene")),
+			),
 			confidence = BigDecimal("0.95"),
 			at = at,
 		)
@@ -345,6 +420,19 @@ class SpringAiDailyAiInterpreterTest {
 		val callbacks = requireNotNull((prompt.options as ToolCallingChatOptions).toolCallbacks)
 		val callback = callbacks.single { it.toolDefinition.name() == toolCall.name() }
 		callback.call(toolCall.arguments(), ToolContext(emptyMap()))
+	}
+
+	private fun findSchemaWithProperty(value: Any?, property: String): Map<*, *>? = when (value) {
+		is Map<*, *> -> {
+			val properties = value["properties"] as? Map<*, *>
+			if (properties?.containsKey(property) == true) {
+				value
+			} else {
+				value.values.firstNotNullOfOrNull { nested -> findSchemaWithProperty(nested, property) }
+			}
+		}
+		is Iterable<*> -> value.firstNotNullOfOrNull { nested -> findSchemaWithProperty(nested, property) }
+		else -> null
 	}
 
 	private class ScriptedChatModel(
@@ -381,6 +469,29 @@ class SpringAiDailyAiInterpreterTest {
 			  "fields": {},
 			  "note": "Oggi mi sento bene",
 			  "confidence": 0.95
+			}
+		""".trimIndent()
+		val VALID_FOOD_CREATE_CAPTURE_ARGUMENTS = """
+			{
+			  "type": "FOOD",
+			  "meals": [
+			    {
+			      "mealName": "pranzo",
+			      "items": [
+			        {
+			          "foodName": "pollo",
+			          "quantity": 100,
+			          "unit": "g",
+			          "calories": 165.25,
+			          "proteinG": 31.125,
+			          "carbsG": 0,
+			          "fatG": 3.6
+			        }
+			      ]
+			    }
+			  ],
+			  "fields": {},
+			  "confidence": 0.88
 			}
 		""".trimIndent()
 		val FORBIDDEN_MODEL_CONTROLLED_FIELDS = setOf(

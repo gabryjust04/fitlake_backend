@@ -32,6 +32,9 @@ data class DailyDay(
 		require(status != DailyDayStatus.CONFIRMED || confirmedAt != null) {
 			"A confirmed day requires a confirmation timestamp"
 		}
+		require(status != DailyDayStatus.REOPENED || confirmedAt != null && reopenedAt != null) {
+			"A reopened day requires confirmation and reopening timestamps"
+		}
 	}
 
 	fun ensureEditable() {
@@ -45,6 +48,15 @@ data class DailyDay(
 		return copy(
 			status = DailyDayStatus.CONFIRMED,
 			confirmedAt = at,
+			updatedAt = maxOf(updatedAt, at),
+		)
+	}
+
+	fun reopen(at: Instant): DailyDay {
+		check(status == DailyDayStatus.CONFIRMED) { "Only a confirmed day can be reopened" }
+		return copy(
+			status = DailyDayStatus.REOPENED,
+			reopenedAt = at,
 			updatedAt = maxOf(updatedAt, at),
 		)
 	}

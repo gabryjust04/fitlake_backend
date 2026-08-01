@@ -74,10 +74,10 @@ data class AiFoodItemProposal(
 	val foodName: String? = null,
 	val quantity: BigDecimal? = null,
 	val unit: String? = null,
-	val calories: Int? = null,
-	val proteinG: BigDecimal? = null,
-	val carbsG: BigDecimal? = null,
-	val fatG: BigDecimal? = null,
+	val calories: BigDecimal,
+	val proteinG: BigDecimal,
+	val carbsG: BigDecimal,
+	val fatG: BigDecimal,
 )
 
 data class AiDailyFieldsProposal(

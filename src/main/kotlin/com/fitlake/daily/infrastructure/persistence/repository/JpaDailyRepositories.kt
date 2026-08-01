@@ -52,6 +52,12 @@ class JpaDailyCaptureRepository(
 	override fun findByIdForUpdate(captureId: DailyCaptureId): DailyCapture? =
 		repository.findByCaptureIdForUpdate(captureId.value)?.let(mapper::toDomain)
 
+	override fun findByIdAndUserId(captureId: DailyCaptureId, userId: UserId): DailyCapture? =
+		repository.findByCaptureIdAndUserId(captureId.value, userId.value)?.let(mapper::toDomain)
+
+	override fun findByIdAndUserIdForUpdate(captureId: DailyCaptureId, userId: UserId): DailyCapture? =
+		repository.findByCaptureIdAndUserIdForUpdate(captureId.value, userId.value)?.let(mapper::toDomain)
+
 	override fun findBySourceEventId(sourceEventId: UUID): DailyCapture? =
 		repository.findBySourceEventId(sourceEventId)?.let(mapper::toDomain)
 

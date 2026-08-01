@@ -4,6 +4,7 @@ import com.fitlake.daily.application.ai.AiCaptureProposal
 import com.fitlake.daily.application.ai.AiFoodItemProposal
 import com.fitlake.daily.application.ai.AiMealProposal
 import com.fitlake.daily.application.ai.DailyAiAuditService
+import com.fitlake.daily.application.ai.DailyAiCaptureProposalFactory
 import com.fitlake.daily.application.ai.DailyAiIdempotencyConflictException
 import com.fitlake.daily.application.ai.DailyAiInvalidOutputException
 import com.fitlake.daily.application.ai.DailyAiMessageService
@@ -14,14 +15,16 @@ import com.fitlake.daily.application.ai.DailyAiProviderMetadata
 import com.fitlake.daily.application.ai.DailyAiRequestContext
 import com.fitlake.daily.application.ai.DailyAiResult
 import com.fitlake.daily.application.ai.DailyAiTerminalService
-import com.fitlake.daily.application.capture.DailyCaptureInput
 import com.fitlake.daily.application.capture.DailyCaptureService
-import com.fitlake.daily.application.capture.DailyFieldsInput
-import com.fitlake.daily.application.capture.DailyPayloadFactory
+import com.fitlake.daily.application.port.DailyAiUserFoodMatchPort
+import com.fitlake.daily.application.port.DailyAiUserFoodMatchResult
 import com.fitlake.daily.domain.ai.AiInterpretationStatus
 import com.fitlake.daily.domain.capture.DailyCaptureActor
+import com.fitlake.daily.domain.capture.DailyCaptureEntryType
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.daily.domain.capture.DailyCaptureType
+import com.fitlake.daily.domain.capture.DailyFoodItemSourceType
+import com.fitlake.daily.domain.capture.DAILY_CAPTURE_SCHEMA_VERSION
 import com.fitlake.daily.domain.common.DailyDay
 import com.fitlake.daily.domain.common.DailyDayStatus
 import com.fitlake.daily.domain.inbox.DailyInboxChannel
@@ -35,6 +38,7 @@ import com.fitlake.support.InMemoryDailyDayRepository
 import com.fitlake.support.InMemoryDailyInboxEventRepository
 import com.fitlake.support.InMemoryUserAccountRepository
 import com.fitlake.support.ScriptedDailyAiInterpreter
+import com.fitlake.support.dailyFieldsPayload
 import com.fitlake.user.application.UserQueryService
 import com.fitlake.user.domain.UserAccount
 import com.fitlake.user.domain.UserId
@@ -86,7 +90,6 @@ class DailyAiMessageServiceTest {
 		captureService = DailyCaptureService(
 			dayRepository = days,
 			captureRepository = captures,
-			payloadFactory = DailyPayloadFactory(),
 			transactionExecutor = ImmediateTransactionExecutor,
 			clock = clock,
 		)
@@ -104,6 +107,7 @@ class DailyAiMessageServiceTest {
 			inboxEventRepository = inboxEvents,
 			interpretationLogRepository = interpretationLogs,
 			captureService = captureService,
+			proposalFactory = DailyAiCaptureProposalFactory(noCatalogMatches()),
 			transactionExecutor = ImmediateTransactionExecutor,
 			clock = clock,
 		)
@@ -131,13 +135,39 @@ class DailyAiMessageServiceTest {
 		assertEquals(DailyCaptureActor.AI, capture.createdBy)
 		assertEquals(BigDecimal("0.91"), capture.confidence)
 		assertNotNull(capture.sourceEventId)
-		assertTrue(capture.payload.meals.single().mealTempId.startsWith("meal_"))
-		assertTrue(capture.payload.meals.single().items.single().itemTempId.startsWith("item_"))
+		assertEquals(DAILY_CAPTURE_SCHEMA_VERSION, capture.payload.schemaVersion)
+		val foodItem = capture.payload.entries.single().items.single()
+		assertEquals(DailyFoodItemSourceType.AI_ESTIMATE, foodItem.sourceType)
+		assertEquals("150", foodItem.calculatedNutrition.caloriesKcal?.toPlainString())
+		assertEquals(foodItem.itemId.toString(), capture.payload.meals.single().items.single().itemTempId)
 		assertEquals(date, days.findById(capture.dayId)?.dayDate)
 		assertEquals(1, captures.count())
 		assertEquals(1, inboxEvents.count())
 		assertEquals(1, interpretationLogs.count())
-		assertEquals(AiInterpretationStatus.SUCCESS, interpretationLogs.all().single().status)
+		val interpretationLog = interpretationLogs.all().single()
+		assertEquals(AiInterpretationStatus.SUCCESS, interpretationLog.status)
+		val nutritionResolutions = interpretationLog.parsedOutput["nutritionResolutions"] as List<*>
+		assertEquals("NO_MATCH", (nutritionResolutions.single() as Map<*, *>)["outcome"])
+	}
+
+	@Test
+	fun `AI note insertion persists and replays only schema v2 entries`() {
+		interpreter.script(
+			DailyAiScript.CreateCapture(AiCaptureProposal(type = "NOTE", note = "Giornata tranquilla")),
+		)
+
+		val created = assertIs<DailyAiResult.CaptureCreated>(
+			messageService.submitMessage(userId, date, "note-v2", "Giornata tranquilla"),
+		)
+		val replayed = assertIs<DailyAiResult.CaptureCreated>(
+			messageService.submitMessage(userId, date, "note-v2", "Giornata tranquilla"),
+		)
+
+		assertEquals(DAILY_CAPTURE_SCHEMA_VERSION, created.capture.payload.schemaVersion)
+		assertEquals(DailyCaptureEntryType.NOTE, created.capture.payload.entries.single().type)
+		assertEquals("Giornata tranquilla", created.capture.payload.entries.single().text)
+		assertEquals(created.capture.captureId, replayed.capture.captureId)
+		assertEquals(1, captures.count())
 	}
 
 	@Test
@@ -248,7 +278,7 @@ class DailyAiMessageServiceTest {
 				at = staleAt,
 			),
 		)
-		val metadata = DailyAiProviderMetadata("TEST", "test-model", "daily-capture-v1")
+		val metadata = DailyAiProviderMetadata("TEST", "test-model", "daily-capture-v2")
 		val staleContext = DailyAiRequestContext(
 			inboxEventId = event.inboxEventId,
 			userId = userId,
@@ -371,7 +401,7 @@ class DailyAiMessageServiceTest {
 
 	@Test
 	fun `confirmed day rejects a new message before invoking AI`() {
-		val existing = captureService.create(userId, date, manualFieldsInput())
+		val existing = captureService.createFromUser(userId, date, manualFieldsPayload())
 		val confirmed = requireNotNull(days.findById(existing.dayId)).confirm(now.plusSeconds(1))
 		days.save(confirmed)
 		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
@@ -582,6 +612,10 @@ class DailyAiMessageServiceTest {
 						foodName = foodName,
 						quantity = BigDecimal("40"),
 						unit = "grammi",
+						calories = BigDecimal("150"),
+						proteinG = BigDecimal("5"),
+						carbsG = BigDecimal("27"),
+						fatG = BigDecimal("3"),
 					),
 				),
 			),
@@ -589,12 +623,11 @@ class DailyAiMessageServiceTest {
 		confidence = BigDecimal("0.91"),
 	)
 
-	private fun manualCapture() = captureService.create(userId, date, manualFieldsInput())
+	private fun noCatalogMatches() = DailyAiUserFoodMatchPort { _, _ -> DailyAiUserFoodMatchResult.None }
 
-	private fun manualFieldsInput() = DailyCaptureInput(
-		type = DailyCaptureType.DAILY_FIELDS,
-		fields = DailyFieldsInput(sleepHours = BigDecimal("7")),
-	)
+	private fun manualCapture() = captureService.createFromUser(userId, date, manualFieldsPayload())
+
+	private fun manualFieldsPayload() = dailyFieldsPayload(sleepHours = BigDecimal("7"))
 
 	private fun account(id: UserId) = UserAccount(
 		userId = id,

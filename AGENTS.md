@@ -4,7 +4,7 @@
 
 FitLake is a personal daily tracking system.
 
-The primary product scope is the **Daily module**. The backend also contains a supporting private food-catalog module whose only current responsibility is manually managed reusable nutrition definitions. It is not yet connected to Daily captures or AI interpretation.
+The primary product scope is the **Daily module**. The backend also contains a supporting private food-catalog module for manually managed reusable nutrition definitions. Manual Daily content links definitions by an exact selected `userFoodId`; natural-language insertion may read one exact and unique active owned name/alias match as described below. AI estimates never create or update catalog definitions.
 
 The system tracks daily personal data such as:
 
@@ -163,10 +163,11 @@ User sends text
 Typical mobile UI edit flow:
 
 ```text
-User edits an item from the mobile app
-→ target capture/item is already known by ID
-→ backend validates ownership and payload
-→ backend updates the accepted capture directly
+User edits one or more values from the mobile app
+→ target capture is known by ID and current version
+→ client submits the complete replacement entries array
+→ backend validates ownership and the whole payload atomically
+→ backend replaces the editable capture and writes one UI_EDIT audit
 ```
 
 Typical day finalization flow:
@@ -195,9 +196,9 @@ POST   /api/daily/captures/{captureId}/accept
 POST   /api/daily/captures/{captureId}/reject
 POST   /api/daily/captures/{captureId}/reprocess
 PUT    /api/daily/captures/{captureId}
-PATCH  /api/daily/captures/{captureId}/food-items/{itemTempId}
 DELETE /api/daily/captures/{captureId}
 POST   /api/daily/days/{date}/finalize
+POST   /api/daily/days/{date}/reopen
 GET    /api/daily/days/{date}/metrics
 ```
 
@@ -205,15 +206,17 @@ Important REST rules:
 
 * REST controllers obtain only the internal `UserId` from `CurrentUserProvider`.
 * A manual REST insertion creates a `daily_capture` with `created_by = USER_UI`, `status = OPEN`, and `source_event_id = null`.
-* The backend generates payload meal/item references when the client omits them.
-* Clients may supply stable meal/item references for precise subsequent UI edits.
+* Manual and AI captures use schema v2 typed entries only; v1 and missing-version payloads are unsupported.
+* The backend generates entry/item UUIDs when the client omits them.
+* `PUT /captures/{captureId}` is the only content-update route and replaces the complete entries array.
 * Capture and day ownership must be checked on every command and query.
 * Returning `404` for a capture owned by another user is preferred to leaking its existence.
-* Confirmed days are immutable in the current slice; reopening is not implemented yet.
+* Confirmed days are immutable until `POST /days/{date}/reopen` changes them to `REOPENED`.
+* Reopening marks the existing metrics snapshot `REOPENED`; the next finalization recalculates and updates it.
 * Finalization returns `409` while any open capture exists.
 * Only accepted captures contribute to the metrics snapshot.
 * Repeated scalar fields use the last non-null value in deterministic capture creation order.
-* Food logs concatenate meals; provided calories and macros are summed.
+* Food logs concatenate meals; calories and core macros are summed with strict unknown-value propagation.
 * Finalization is idempotent and returns the existing snapshot for an already confirmed day.
 * REST validation errors return `400`, missing resources return `404`, and invalid state transitions return `409`.
 * `POST /days/{date}/messages` and `POST /captures/{captureId}/reprocess` require an `Idempotency-Key` header.
@@ -236,7 +239,9 @@ user food = reusable catalog definition
 daily capture = occurrence consumed on a date
 ```
 
-The catalog is authenticated, private, manually managed, and independent from Daily and AI. Creating, reading, updating, deleting, listing, or searching a user food must not create or modify a `daily_day`, `daily_capture`, `daily_inbox_event`, or `ai_interpretation_log`, and must not call Spring AI or an external nutrition provider.
+The catalog is authenticated, private, and manually managed. Its CRUD and frontend search operations remain independent from Daily and AI: creating, reading, updating, deleting, listing, or searching a user food must not create or modify a `daily_day`, `daily_capture`, `daily_inbox_event`, or `ai_interpretation_log`, and must not call Spring AI or an external nutrition provider.
+
+Daily has two narrow, read-only integration paths. Manual input may load one exact active owned definition after the frontend selects a `userFoodId`. Natural-language insertion may resolve an AI-extracted food name through `DailyAiUserFoodMatchPort`, but only against exact normalized active names and aliases owned by the authenticated user. Neither path may mutate the catalog or expose foreign/deleted definitions.
 
 REST routes:
 
@@ -309,7 +314,7 @@ AI_ESTIMATE
 IMPORTED
 ```
 
-They are provenance metadata only. `EXTERNAL_DATABASE` requires provider and external ID metadata, but the catalog does not contact that provider. `AI_ESTIMATE` marks existing entered values as estimated; it does not authorize an AI call.
+They are catalog provenance metadata only. `EXTERNAL_DATABASE` requires provider and external ID metadata, but the catalog does not contact that provider. Catalog provenance `AI_ESTIMATE` marks existing entered values as estimated; it does not authorize an AI call and is distinct from the `AI_ESTIMATE` source of a Daily capture item.
 
 Example product-label definition:
 
@@ -349,14 +354,36 @@ Search is conventional PostgreSQL search, not RAG or semantic search. Each branc
 
 Prefix matching uses normalized B-tree pattern indexes. Fuzzy name and alias matching use `pg_trgm` GIN indexes with a transaction-local similarity threshold of `0.30`. Within one rank, order by score descending and then stable normalized name/ID tie-breakers. Search responses may expose `matchedBy`, `matchedText`, and score, but controllers must not implement normalization or ranking.
 
-Future Daily integration must go through the application-level search use case, not the PostgreSQL adapter directly. For every consumed personal food, a future capture must preserve both:
+Daily manual capture integration goes through `DailyUserFoodLookupPort`, which loads one exact active food by authenticated `UserId` plus `userFoodId`. It must never call search, ranking, controllers, or JPA directly. For every consumed personal food, a capture preserves both:
 
 ```text
 reference to userFoodId
-+ immutable snapshot of name, consumed amount/unit, nutrition values, and nutrition source used at capture time
++ immutable snapshot of name/brand, entered and resolved quantity, basis, all nutrient values, default serving, conversions, source, and lightweight catalog version metadata used at capture time
 ```
 
-Updating or deleting a catalog definition must never rewrite historical capture nutrition. Do not implement this integration unless explicitly requested.
+Updating or deleting a catalog definition must never rewrite historical capture nutrition. A new or changed reference requires an active owned food. An existing unchanged reference may remain after deletion, and a quantity-only edit recalculates from the stored snapshot.
+
+### Deterministic manual Daily content
+
+Manual structured Daily input never invokes AI. One submission creates one capture. A capture may contain multiple typed entries, a `FOOD` entry may contain multiple exact personal-food items, and food plus scalar entries forms one mixed capture.
+
+```text
+frontend searches /api/me/foods
+→ user selects exact userFoodId
+→ Daily application validates owned active food
+→ deterministic BigDecimal conversion/calculation
+→ schema-v2 Daily payload with immutable snapshot
+```
+
+Supported consumption units are `GRAM`, `KILOGRAM`, `MILLILITER`, `LITER`, `PIECE`, `SERVING`, and `DEFAULT_SERVING`. Convert kg/g and l/ml directly. Cross dimension conversion is valid only with the exact saved piece/serving metadata. Never infer density, serving size, package size, or grams per piece.
+
+Typed capture entry/item IDs are backend-generated UUIDs. On full replacement, a supplied ID is valid only when it already belongs to the target owned capture. Omitted entries/items are removed. `PUT /api/daily/captures/{captureId}` is the only content-update endpoint; it requires the current capture version and atomically validates, resolves, calculates, persists, increments the version, and writes a `UI_EDIT` audit containing old/new payloads and versions. Stale versions return `409` without mutation.
+
+An `AI_ESTIMATE` item is created only by the natural-language insertion flow. Full replacement may preserve an existing estimated item only when its existing item ID, source type, and entered quantity are unchanged, or remove it by omission. A client must not create a new `AI_ESTIMATE`, change its quantity or nutrition, or convert it to another source through the full `PUT`; correction requires complete-text AI reprocess.
+
+Payload JSONB is versioned centrally and only schema v2 is supported during development. Encoders always write version 2; readers reject missing, v1, non-integral, and unknown future versions. Existing development databases containing v1 capture or AI-audit JSONB must be recreated rather than supported by compatibility branches. AI catalog resolution must use the narrow application port and must not call catalog controllers, generic frontend search, or persistence APIs directly.
+
+`OPEN` captures and `ACCEPTED` captures on `OPEN` or `REOPENED` days may use full replacement; their state is preserved. `REJECTED`, `SOFT_DELETED`, `EXPIRED`, and captures on confirmed days are immutable. Finalization reads only authoritative stored v2 entries and their immutable nutrition snapshots; any derived projection is internal and never restores v1 wire compatibility.
 
 ---
 
@@ -368,6 +395,7 @@ AI may:
 
 * extract food items
 * extract quantities and units
+* estimate calories, protein, carbohydrates, and fat for the complete consumed quantity of every extracted food item
 * infer meal names when reasonable
 * extract daily fields such as sleep or weight
 * produce a structured capture proposal
@@ -385,8 +413,24 @@ AI must not:
 * bypass backend validation
 * decide final state alone
 * put business logic into prompts
+* search the personal-food catalog or invent catalog IDs or matches
 
 AI output must be structured and validated before being saved.
+
+The active prompt contract is `daily-capture-v2`. Every proposed food item must contain non-null, non-negative `calories`, `proteinG`, `carbsG`, and `fatG` values for that item's complete consumed quantity. Missing or invalid core estimates make the tool output invalid; missing nutrition alone is not a clarification reason.
+
+After the model call, the backend resolves each food item independently:
+
+* `DailyAiUserFoodMatchPort` considers only exact normalized active names and aliases scoped to the authenticated internal `UserId`.
+* Prefix and fuzzy matches are never accepted automatically by the AI flow, even though they remain available to the frontend catalog search endpoint.
+* Zero exact matches means use the complete AI quartet.
+* More than one exact matching food is ambiguous and means use the complete AI quartet.
+* One exact match is used only when calories plus all three core macronutrients are present and the entered unit converts deterministically through the saved basis/default-serving/conversion metadata.
+* A usable unique match becomes `USER_FOOD`; backend calculation from its immutable snapshot replaces all four AI estimates.
+* An absent, ambiguous, nutritionally incomplete, or unconvertible match becomes `AI_ESTIMATE`; use all four AI values together and never mix catalog and AI nutrients within one item.
+* Never coerce missing catalog nutrients to zero.
+
+Both outcomes create an ordinary `OPEN` proposal and require user confirmation. An `AI_ESTIMATE` has no `userFoodId` or user-food snapshot and must never be inserted into or used to update the private catalog. Audit data should retain both the original AI estimate and the backend resolution outcome.
 
 Allowed AI operations for MVP:
 
@@ -435,13 +479,14 @@ Application services should include:
 * `AiCaptureInterpreterService`
 * `DailyCaptureService`
 * `DailyCaptureEditService`
+* `DailyManualCaptureService`
 * `CaptureConfirmationService`
 * `DailyFinalizationService`
 * `DailyMetricsProjectionService`
 * `UserFoodService`
 * `UserFoodSearchService`
 
-`SearchUserFoodsUseCase` is the future-facing application boundary for personal-food lookup. Daily and AI code must not depend on JPA repositories, JDBC queries, or `pg_trgm` details.
+`SearchUserFoodsUseCase` is the frontend-facing catalog search boundary. Manual Daily content uses `DailyUserFoodLookupPort` for exact ownership-safe ID lookup. Natural-language resolution uses `DailyAiUserFoodMatchPort`, whose infrastructure adapter may query exact normalized active names/aliases and then return a Daily-owned read model. Application/domain code must not depend on catalog JPA repositories, JDBC queries, controllers, frontend ranking, or `pg_trgm` details.
 
 Do not put business logic in controllers.
 
@@ -765,7 +810,9 @@ Important rules:
 
 * A day starts as `OPEN`.
 * When the user closes the day, status becomes `CONFIRMED`.
-* If future edits are allowed after confirmation, the day may become `REOPENED` or metrics may be recalculated.
+* A confirmed day may be explicitly reopened; both `daily_day` and its existing metrics snapshot become `REOPENED`.
+* Repeated reopen on an already reopened day is idempotent; reopening an initial `OPEN` day is a conflict.
+* Finalizing a reopened day recalculates from current accepted captures, updates the same metrics row, and returns both states to `CONFIRMED`.
 
 ---
 
@@ -930,7 +977,7 @@ Purpose:
 * represent one proposed daily insertion
 * allow the user to confirm or reject it
 * store multiple foods in one capture
-* support direct mobile edits after confirmation
+* support atomic full-capture replacement from mobile after confirmation when the day is editable
 * act as source data for final daily metrics
 
 Important rules:
@@ -1318,7 +1365,7 @@ Do not physically delete rejected captures.
 
 ### Flow: Mobile UI Edit
 
-The mobile app can edit accepted captures directly.
+The mobile app replaces one editable capture atomically. There is no item-level mutation endpoint.
 
 Example:
 
@@ -1329,13 +1376,13 @@ User changes avena from 40 g to 50 g.
 Flow:
 
 ```text
-DailyCaptureEditController
-→ DailyCaptureEditService.updateFoodItemQuantity()
+PUT /api/daily/captures/{captureId}
+→ DailyManualCaptureService.replace()
 → validate user ownership
-→ validate capture status
-→ validate quantity and unit
-→ update daily_capture.payload
-→ increment version
+→ lock and validate day/capture status and expected version
+→ validate every submitted entry and food snapshot/calculation
+→ replace the complete schema-v2 entries array
+→ increment version and write one UI_EDIT audit row
 ```
 
 Rules:
@@ -1343,10 +1390,11 @@ Rules:
 * No AI.
 * No proposal.
 * No Telegram-specific logic.
-* The target item is already known by ID or by deterministic payload reference.
-* All edit logic must live in `DailyCaptureEditService`, not the controller.
+* The target capture and current version are known; existing entry/item IDs may be reused only within it.
+* Omitted entries/items are removed, so the request represents the complete desired capture.
+* All replacement logic must live in `DailyManualCaptureService` and its content factory, not the controller.
 
-For MVP, direct JSONB update is allowed through a service.
+For MVP, replacing JSONB through the application service is allowed.
 
 Future versions may replace this internally with mutation/event records, but external API should not depend on that implementation detail.
 
@@ -1406,6 +1454,28 @@ Rules:
 * Only `ACCEPTED` captures contribute to final metrics.
 * Finalization must be deterministic.
 * Running finalization twice should not duplicate metrics.
+* Aggregate calories, protein, carbohydrates, and fat across every accepted food item with decimal-safe arithmetic.
+* Resolve weight, sleep, steps, hydration, caffeine, mood, focus, stress, and daily notes from accepted captures in deterministic creation order; the last non-null value wins.
+* Unknown nutrition remains unknown: if any contributing item lacks one nutrient, that daily nutrient total is `null`, never a partial total or implicit zero.
+* On `REOPENED`, recompute from scratch and upsert the existing metrics row with preserved `created_at` and a new `recalculated_at`.
+
+### Flow: Day Reopening
+
+```text
+POST /api/daily/days/{date}/reopen
+→ lock the owned daily_day
+→ require CONFIRMED (or replay REOPENED idempotently)
+→ require one consistent confirmed metrics snapshot
+→ mark daily_metrics as REOPENED
+→ mark daily_day as REOPENED
+```
+
+Rules:
+
+* Reopening and finalization serialize on the day lock.
+* The reopened metrics row is an explicitly stale snapshot until refinalization.
+* Creating, accepting/rejecting, fully replacing, and soft-deleting captures is allowed again while reopened.
+* Refinalization still fails while an `OPEN` capture exists.
 
 ---
 
@@ -1430,6 +1500,11 @@ Minimum validations:
 * field name is supported
 * field value type is correct
 * day is not finalized unless the use case allows reopening/recalculation
+* every AI food proposal contains non-null, non-negative calories, protein, carbohydrates, and fat within defensive bounds
+* every AI nutrition value describes the complete extracted consumed quantity
+* an automatic catalog match is exact, unique, active, owned, nutritionally complete for the four core values, and deterministically convertible
+* an AI fallback uses the complete estimate quartet without mixing catalog nutrients
+* a full-content request can only preserve or remove an existing `AI_ESTIMATE`; it cannot create or modify one
 
 For the private food catalog also validate:
 
@@ -1463,6 +1538,9 @@ Transaction 1:
 Outside transaction:
 - call AI
 - parse AI output
+- validate the complete AI estimate quartet for every food
+- resolve each food through short reads on the exact user-scoped catalog match port
+- build and validate the schema-v2 `USER_FOOD` or `AI_ESTIMATE` payload
 
 Transaction 2:
 - save ai_interpretation_log
@@ -1479,11 +1557,15 @@ Recommended finalization flow:
 ```text
 Single transaction:
 - lock daily_day
+- validate existing metrics status against day status
+- reject unresolved OPEN captures
 - load accepted captures
-- aggregate
-- upsert daily_metrics
+- aggregate all nutrition and personal-state fields from scratch
+- insert or update the single daily_metrics row
 - mark daily_day CONFIRMED
 ```
+
+Reopening is also one transaction: lock the owned day first, mark the consistent confirmed metrics row `REOPENED`, then mark the day `REOPENED`. No capture mutation, reopen, or finalization path may bypass the day-level serialization invariant.
 
 Use optimistic locking on:
 
@@ -1569,9 +1651,10 @@ Mobile can:
 
 * list daily captures
 * list current daily state
-* edit accepted captures directly
+* replace the complete content of an editable accepted capture through the single full PUT
 * soft delete captures
 * close the day
+* reopen a confirmed day before changing it
 * show finalized metrics
 * optionally submit text to the same AI insertion flow
 
@@ -1660,6 +1743,14 @@ Never convert between mass/volume and piece/serving without explicit conversion 
 
 Never update historical Daily data when a catalog definition changes or is soft-deleted.
 
+Never use prefix or fuzzy catalog matches for automatic AI nutrition resolution.
+
+Never mix catalog and AI values within one resolved food item.
+
+Never write an AI fallback estimate into the private food catalog.
+
+Never let manual full-content input create or modify an `AI_ESTIMATE` item.
+
 ---
 
 ## Testing Expectations
@@ -1672,12 +1763,15 @@ Prioritize tests for:
 * capture creation
 * capture confirmation
 * capture rejection
-* direct mobile edit
+* single-endpoint atomic full-capture replacement and removal of granular/legacy routes
 * soft delete
 * day finalization
 * aggregation of multiple food items
 * rejected captures excluded from metrics
 * open captures blocking finalization
+* aggregation of all personal-state fields and strict unknown nutrition totals
+* confirmed-to-reopened transition, stale metrics status, edit while reopened, and refinalization upsert
+* repeated reopen/finalize idempotency and ownership-safe missing-day behavior
 * invalid units
 * invalid quantities
 * user ownership checks
@@ -1688,6 +1782,13 @@ Prioritize tests for:
 * public health and protected API endpoint policy
 * authentication identity uniqueness and persistence mapping
 * one terminal AI tool and defensive rejection of zero/multiple/unknown tools or free text
+* prompt `daily-capture-v2` and required decimal calories/protein/carbohydrates/fat for every proposed food item
+* rejection of missing, negative, or out-of-range AI nutrition estimates without a partial capture
+* exact unique owned name/alias catalog match overriding the complete AI estimate
+* no-match, ambiguous-match, incomplete-catalog, and unconvertible-catalog fallback to the complete AI quartet
+* prefix/fuzzy and foreign/deleted food exclusion from automatic AI matching
+* no mixing of catalog and AI nutrients, and no catalog mutation from AI estimates
+* preservation/removal-only semantics for existing `AI_ESTIMATE` items in full-content replacement
 * AI message idempotency, immutable replay, and stale-processing recovery
 * complete-text reprocess success and failure invariants
 * atomic replacement rollback and concurrent reprocess locking on PostgreSQL
@@ -1724,9 +1825,13 @@ A task is done only when:
 * new tables or columns are documented
 * authenticated use cases depend on the internal `UserId`, not Firebase SDK types
 * authentication tests do not require real provider credentials
-* personal-food endpoints remain manual, private, and independent from Daily and AI
+* personal-food CRUD/search endpoints remain manual, private, and side-effect independent from Daily and AI
 * personal-food nutrients preserve unknown values as null and use decimal-safe types
 * personal-food search remains user-scoped, deterministic, and backed by the V4 PostgreSQL indexes
-* future Daily integration preserves an immutable nutrition snapshot rather than reading mutable catalog values as history
+* Daily linked-food captures preserve an immutable nutrition snapshot rather than reading mutable catalog values as history
+* capture APIs and JSONB use schema v2 only, with one atomic full-replacement PUT and no granular or v1 compatibility routes
+* new AI food captures use schema v2 and preserve either an immutable `USER_FOOD` snapshot or a complete `AI_ESTIMATE`
+* exact AI catalog resolution remains user-scoped, unique, non-fuzzy, nutritionally complete, and deterministically convertible
+* AI fallback estimates remain confirmable Daily state and never mutate the personal-food catalog
 * Telegram and mobile flows still use shared backend services
-* daily finalization remains deterministic
+* daily finalization remains deterministic, aggregates every supported metric, and refinalization updates the reopened snapshot without duplication

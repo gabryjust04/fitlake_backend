@@ -18,6 +18,7 @@ import com.fitlake.daily.domain.inbox.DailyInboxEvent
 import com.fitlake.daily.domain.inbox.DailyInboxEventId
 import com.fitlake.daily.domain.metrics.DailyMetrics
 import com.fitlake.user.domain.UserId
+import org.springframework.dao.OptimisticLockingFailureException
 import java.time.LocalDate
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -64,6 +65,12 @@ class InMemoryDailyCaptureRepository : DailyCaptureRepository {
 
 	override fun findByIdForUpdate(captureId: DailyCaptureId): DailyCapture? = findById(captureId)
 
+	override fun findByIdAndUserId(captureId: DailyCaptureId, userId: UserId): DailyCapture? =
+		findById(captureId)?.takeIf { it.userId == userId }
+
+	override fun findByIdAndUserIdForUpdate(captureId: DailyCaptureId, userId: UserId): DailyCapture? =
+		findByIdAndUserId(captureId, userId)
+
 	override fun findBySourceEventId(sourceEventId: UUID): DailyCapture? =
 		captures.values.firstOrNull { it.sourceEventId == sourceEventId }
 
@@ -90,8 +97,17 @@ class InMemoryDailyCaptureRepository : DailyCaptureRepository {
 			failureOnNextSave = null
 			throw failure
 		}
-		captures[capture.captureId] = capture
-		return capture
+		val existing = captures[capture.captureId]
+		val persisted = if (existing == null) {
+			capture
+		} else {
+			if (capture.version != existing.version) {
+				throw OptimisticLockingFailureException("stale daily capture")
+			}
+			capture.copy(version = capture.version + 1)
+		}
+		captures[persisted.captureId] = persisted
+		return persisted
 	}
 
 	fun count(): Int = captures.size

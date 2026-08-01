@@ -1,72 +1,56 @@
 package com.fitlake.daily.domain
 
-import com.fitlake.daily.application.DailyValidationException
-import com.fitlake.daily.application.capture.DailyCaptureInput
-import com.fitlake.daily.application.capture.DailyPayloadFactory
-import com.fitlake.daily.application.capture.MealInput
-import com.fitlake.daily.application.capture.MealItemInput
+import com.fitlake.daily.domain.capture.DAILY_CAPTURE_SCHEMA_VERSION
+import com.fitlake.daily.domain.capture.DailyCaptureEntry
+import com.fitlake.daily.domain.capture.DailyCaptureEntryType
+import com.fitlake.daily.domain.capture.DailyCapturePayload
 import com.fitlake.daily.domain.capture.DailyCaptureType
+import com.fitlake.daily.domain.capture.DailyScalarUnit
 import org.junit.jupiter.api.Test
 import java.math.BigDecimal
+import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertTrue
 
 class DailyCapturePayloadTest {
-	private val factory = DailyPayloadFactory()
-
 	@Test
-	fun `food payload normalizes units and generates stable item references`() {
-		val payload = factory.create(foodInput(unit = "grammi"))
-
-		assertEquals("g", payload.meals.single().items.single().unit)
-		assertTrue(payload.meals.single().mealTempId.startsWith("meal_"))
-		assertTrue(payload.meals.single().items.single().itemTempId.startsWith("item_"))
-	}
-
-	@Test
-	fun `food payload rejects invalid quantity`() {
-		assertFailsWith<DailyValidationException> {
-			factory.create(foodInput(quantity = BigDecimal.ZERO))
-		}
-	}
-
-	@Test
-	fun `food payload rejects unsupported units`() {
-		assertFailsWith<DailyValidationException> {
-			factory.create(foodInput(unit = "secchio"))
-		}
-	}
-
-	@Test
-	fun `food type requires at least one meal`() {
-		assertFailsWith<DailyValidationException> {
-			factory.create(DailyCaptureInput(type = DailyCaptureType.FOOD))
-		}
-	}
-
-	private fun foodInput(
-		quantity: BigDecimal = BigDecimal("40"),
-		unit: String = "g",
-	) = DailyCaptureInput(
-		type = DailyCaptureType.FOOD,
-		meals = listOf(
-			MealInput(
-				mealTempId = null,
-				mealName = "colazione",
-				items = listOf(
-					MealItemInput(
-						itemTempId = null,
-						foodName = "avena",
-						quantity = quantity,
-						unit = unit,
-						calories = 150,
-						proteinG = BigDecimal("5"),
-						carbsG = BigDecimal("27"),
-						fatG = BigDecimal("3"),
-					),
+	fun `typed entries create the current v2 payload and derived projection`() {
+		val payload = DailyCapturePayload.fromEntries(
+			listOf(
+				DailyCaptureEntry(
+					entryId = UUID.randomUUID(),
+					type = DailyCaptureEntryType.WEIGHT,
+					value = BigDecimal("78.4"),
+					unit = DailyScalarUnit.KILOGRAM,
 				),
 			),
-		),
-	)
+		)
+
+		assertEquals(DAILY_CAPTURE_SCHEMA_VERSION, payload.schemaVersion)
+		assertEquals(DailyCaptureType.DAILY_FIELDS, payload.type)
+		assertEquals(BigDecimal("78.4"), payload.fields.bodyWeightKg)
+	}
+
+	@Test
+	fun `schema v1 cannot be instantiated`() {
+		val entry = DailyCaptureEntry(
+			entryId = UUID.randomUUID(),
+			type = DailyCaptureEntryType.NOTE,
+			text = "nota",
+		)
+
+		assertFailsWith<IllegalArgumentException> {
+			DailyCapturePayload(
+				type = DailyCaptureType.NOTE,
+				note = "nota",
+				schemaVersion = 1,
+				entries = listOf(entry),
+			)
+		}
+	}
+
+	@Test
+	fun `empty typed payload is rejected`() {
+		assertFailsWith<IllegalArgumentException> { DailyCapturePayload.fromEntries(emptyList()) }
+	}
 }

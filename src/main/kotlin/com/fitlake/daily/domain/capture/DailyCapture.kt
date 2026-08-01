@@ -93,9 +93,6 @@ data class DailyCapture(
 		)
 	}
 
-	fun updateFoodItem(itemTempId: String, quantity: BigDecimal, unit: String, at: Instant): DailyCapture =
-		replacePayload(payload.updateFoodItem(itemTempId, quantity, unit), at)
-
 	fun softDelete(at: Instant): DailyCapture {
 		check(status != DailyCaptureStatus.SOFT_DELETED && status != DailyCaptureStatus.EXPIRED) {
 			"Capture cannot be soft deleted from its current state"

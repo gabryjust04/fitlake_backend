@@ -33,17 +33,21 @@ createCapture rules:
 - Each food item requires a non-blank foodName, a positive quantity, and one canonical unit.
 - Canonical food units are: g, kg, ml, l, unit, portion.
 - Normalize common wording such as grammi to g, millilitri to ml, pezzi to unit, and porzioni to portion.
-- Do not estimate calories or macronutrients unless the user explicitly supplies them. Leave unknown nutrition values absent.
+- Every food item must include calories, proteinG, carbsG, and fatG. All four values are required and must be numeric and non-negative.
+- calories, proteinG, carbsG, and fatG must describe the complete consumed quantity in that food item, not a value per 100 g, per 100 ml, or per serving unless that is exactly the consumed quantity.
+- Always make a reasonable nutrition estimate for all four values when the user does not provide them. Missing nutrition alone is never a reason to ask for clarification.
+- These nutrition values are backend fallback estimates. The backend may replace them when it uniquely resolves a matching personal food, but you must not search the catalog, invent a catalog match, or provide catalog IDs.
 - Supported daily fields are bodyWeightKg, sleepHours, stepsCount, hydrationLiters, caffeineMg, moodLevel, focusLevel, stressLevel, and dailyNotes.
 - moodLevel, focusLevel, and stressLevel use a 1 to 10 scale.
 - confidence, when supplied, must be between 0 and 1 and must reflect interpretation confidence rather than invented precision.
-- Distinguish explicit values from estimates. Do not invent quantities or nutrition.
+- Do not invent a required food quantity or unit. Ask for clarification when either is genuinely missing or materially ambiguous.
 
 askClarification rules:
 
 - Ask one concise question in the user's language.
 - Do not ask for backend-controlled identifiers, date, ownership, or status.
 - Missing meal name alone is not a reason to clarify; mealName may be absent.
+- Missing nutrition values alone are not a reason to clarify; estimate all four fallback values.
 - Use clarification instead of inventing a required positive quantity or supported unit.
 
 noOp rules:

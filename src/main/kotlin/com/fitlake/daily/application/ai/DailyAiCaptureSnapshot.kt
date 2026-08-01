@@ -1,15 +1,13 @@
 package com.fitlake.daily.application.ai
 
 import com.fitlake.daily.application.DailyStateCorruptionException
+import com.fitlake.daily.application.capture.DailyCapturePayloadCodec
 import com.fitlake.daily.domain.capture.DailyCapture
 import com.fitlake.daily.domain.capture.DailyCaptureActor
 import com.fitlake.daily.domain.capture.DailyCaptureId
 import com.fitlake.daily.domain.capture.DailyCapturePayload
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.daily.domain.capture.DailyCaptureType
-import com.fitlake.daily.domain.capture.DailyFields
-import com.fitlake.daily.domain.capture.MealDraft
-import com.fitlake.daily.domain.capture.MealItemDraft
 import com.fitlake.daily.domain.common.DailyDayId
 import com.fitlake.daily.domain.inbox.DailyInboxEvent
 import com.fitlake.user.domain.UserId
@@ -50,7 +48,10 @@ internal fun DailyCapture.toAiCaptureResult(): DailyAiCaptureResult {
 	)
 }
 
-internal fun DailyAiCaptureResult.toAuditOutput(outcome: String): Map<String, Any?> = linkedMapOf(
+internal fun DailyAiCaptureResult.toAuditOutput(
+	outcome: String,
+	nutritionResolutions: List<DailyAiNutritionResolution> = emptyList(),
+): Map<String, Any?> = linkedMapOf<String, Any?>(
 	"outcome" to outcome,
 	"capture" to linkedMapOf(
 		"captureId" to captureId.value.toString(),
@@ -59,12 +60,16 @@ internal fun DailyAiCaptureResult.toAuditOutput(outcome: String): Map<String, An
 		"sourceEventId" to sourceEventId.toString(),
 		"captureType" to captureType.name,
 		"status" to status.name,
-		"payload" to payload.toAuditMap(),
+		"payload" to DailyCapturePayloadCodec.encode(payload),
 		"createdBy" to createdBy.name,
 		"createdAt" to createdAt.toString(),
 		"version" to version,
 	),
-)
+).also { output ->
+	if (nutritionResolutions.isNotEmpty()) {
+		output["nutritionResolutions"] = nutritionResolutions.map(DailyAiNutritionResolution::toAuditMap)
+	}
+}
 
 internal fun Map<String, Any?>.captureResult(
 	event: DailyInboxEvent,
@@ -79,7 +84,7 @@ internal fun Map<String, Any?>.captureResult(
 		sourceEventId = UUID.fromString(capture.requiredString("sourceEventId")),
 		captureType = DailyCaptureType.valueOf(capture.requiredString("captureType")),
 		status = DailyCaptureStatus.valueOf(capture.requiredString("status")),
-		payload = capture.requiredMap("payload").toPayload(),
+		payload = DailyCapturePayloadCodec.decode(capture.requiredMap("payload")),
 		confidence = confidence,
 		createdBy = DailyCaptureActor.valueOf(capture.requiredString("createdBy")),
 		createdAt = Instant.parse(capture.requiredString("createdAt")),
@@ -103,105 +108,13 @@ internal fun Map<String, Any?>.captureResult(
 	throw DailyStateCorruptionException("AI capture audit snapshot is invalid")
 }
 
-private fun DailyCapturePayload.toAuditMap(): Map<String, Any?> = linkedMapOf(
-	"type" to type.name,
-	"meals" to meals.map(MealDraft::toAuditMap),
-	"fields" to fields.toAuditMap(),
-	"note" to note,
-)
-
-private fun MealDraft.toAuditMap(): Map<String, Any?> = linkedMapOf(
-	"mealTempId" to mealTempId,
-	"mealName" to mealName,
-	"items" to items.map(MealItemDraft::toAuditMap),
-)
-
-private fun MealItemDraft.toAuditMap(): Map<String, Any?> = linkedMapOf(
-	"itemTempId" to itemTempId,
-	"foodName" to foodName,
-	"quantity" to quantity,
-	"unit" to unit,
-	"calories" to calories,
-	"proteinG" to proteinG,
-	"carbsG" to carbsG,
-	"fatG" to fatG,
-)
-
-private fun DailyFields.toAuditMap(): Map<String, Any?> = linkedMapOf(
-	"bodyWeightKg" to bodyWeightKg,
-	"sleepHours" to sleepHours,
-	"stepsCount" to stepsCount,
-	"hydrationLiters" to hydrationLiters,
-	"caffeineMg" to caffeineMg,
-	"moodLevel" to moodLevel,
-	"focusLevel" to focusLevel,
-	"stressLevel" to stressLevel,
-	"dailyNotes" to dailyNotes,
-)
-
-private fun Map<String, Any?>.toPayload(): DailyCapturePayload = DailyCapturePayload(
-	type = DailyCaptureType.valueOf(requiredString("type")),
-	meals = listOfMaps("meals").map { meal ->
-		MealDraft(
-			mealTempId = meal.requiredString("mealTempId"),
-			mealName = meal.optionalString("mealName"),
-			items = meal.listOfMaps("items").map { item ->
-				MealItemDraft(
-					itemTempId = item.requiredString("itemTempId"),
-					foodName = item.requiredString("foodName"),
-					quantity = item.decimal("quantity") ?: error("Missing food quantity"),
-					unit = item.requiredString("unit"),
-					calories = item.int("calories"),
-					proteinG = item.decimal("proteinG"),
-					carbsG = item.decimal("carbsG"),
-					fatG = item.decimal("fatG"),
-				)
-			},
-		)
-	},
-	fields = requiredMap("fields").let { fields ->
-		DailyFields(
-			bodyWeightKg = fields.decimal("bodyWeightKg"),
-			sleepHours = fields.decimal("sleepHours"),
-			stepsCount = fields.int("stepsCount"),
-			hydrationLiters = fields.decimal("hydrationLiters"),
-			caffeineMg = fields.int("caffeineMg"),
-			moodLevel = fields.int("moodLevel"),
-			focusLevel = fields.int("focusLevel"),
-			stressLevel = fields.int("stressLevel"),
-			dailyNotes = fields.optionalString("dailyNotes"),
-		)
-	},
-	note = optionalString("note"),
-)
-
 private fun Map<String, Any?>.requiredString(key: String): String =
 	(this[key] as? String)?.takeIf(String::isNotBlank) ?: error("Missing field $key")
-
-private fun Map<String, Any?>.optionalString(key: String): String? = this[key] as? String
 
 @Suppress("UNCHECKED_CAST")
 private fun Map<String, Any?>.requiredMap(key: String): Map<String, Any?> =
 	this[key] as? Map<String, Any?> ?: error("Missing field $key")
 
-@Suppress("UNCHECKED_CAST")
-private fun Map<String, Any?>.listOfMaps(key: String): List<Map<String, Any?>> =
-	this[key] as? List<Map<String, Any?>> ?: emptyList()
-
-private fun Map<String, Any?>.decimal(key: String): BigDecimal? = when (val value = this[key]) {
-	null -> null
-	is BigDecimal -> value
-	is Number -> value.toString().toBigDecimal()
-	is String -> value.toBigDecimal()
-	else -> error("Invalid decimal field $key")
-}
-
-private fun Map<String, Any?>.int(key: String): Int? = when (val value = this[key]) {
-	null -> null
-	is Number -> value.toInt()
-	is String -> value.toInt()
-	else -> error("Invalid integer field $key")
-}
 
 private fun Map<String, Any?>.long(key: String): Long? = when (val value = this[key]) {
 	null -> null

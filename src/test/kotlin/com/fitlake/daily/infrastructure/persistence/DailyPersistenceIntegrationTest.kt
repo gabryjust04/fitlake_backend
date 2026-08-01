@@ -1,21 +1,19 @@
 package com.fitlake.daily.infrastructure.persistence
 
 import com.fitlake.daily.application.capture.CaptureConfirmationService
-import com.fitlake.daily.application.capture.DailyCaptureInput
 import com.fitlake.daily.application.capture.DailyCaptureService
-import com.fitlake.daily.application.capture.DailyFieldsInput
-import com.fitlake.daily.application.capture.DailyPayloadFactory
-import com.fitlake.daily.application.capture.MealInput
-import com.fitlake.daily.application.capture.MealItemInput
 import com.fitlake.daily.application.finalization.DailyFinalizationService
 import com.fitlake.daily.application.finalization.DailyMetricsProjectionService
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
-import com.fitlake.daily.domain.capture.DailyCaptureType
+import com.fitlake.daily.domain.capture.DailyFoodQuantityUnit
 import com.fitlake.daily.infrastructure.persistence.mapper.DailyPersistenceMapper
 import com.fitlake.daily.infrastructure.persistence.repository.JpaDailyCaptureRepository
 import com.fitlake.daily.infrastructure.persistence.repository.JpaDailyDayRepository
 import com.fitlake.daily.infrastructure.persistence.repository.JpaDailyMetricsRepository
 import com.fitlake.shared.application.TransactionExecutor
+import com.fitlake.support.dailyFieldsPayload
+import com.fitlake.support.dailyFoodPayload
+import com.fitlake.support.manualNutritionItem
 import com.fitlake.user.domain.UserAccount
 import com.fitlake.user.domain.UserId
 import com.fitlake.user.infrastructure.SpringTransactionExecutor
@@ -72,8 +70,7 @@ class DailyPersistenceIntegrationTest @Autowired constructor(
 	private val date = LocalDate.parse("2026-07-28")
 	private val clock = Clock.fixed(now, ZoneId.of("UTC"))
 	private val transactions: TransactionExecutor = SpringTransactionExecutor(transactionManager)
-	private val payloadFactory = DailyPayloadFactory()
-	private val captureService = DailyCaptureService(days, captures, payloadFactory, transactions, clock)
+	private val captureService = DailyCaptureService(days, captures, transactions, clock)
 	private val confirmationService = CaptureConfirmationService(
 		days,
 		captures,
@@ -108,13 +105,13 @@ class DailyPersistenceIntegrationTest @Autowired constructor(
 
 	@Test
 	fun `capture JSONB round trip preserves payload ids and timestamps`() {
-		val created = captureService.create(userId, date, foodInput())
+		val created = captureService.createFromUser(userId, date, foodPayload())
 
 		val loaded = captures.findById(created.captureId)!!
 
 		assertEquals(created.captureId, loaded.captureId)
-		assertEquals("breakfast", loaded.payload.meals.single().mealTempId)
-		assertEquals("oats", loaded.payload.meals.single().items.single().itemTempId)
+		assertEquals(created.payload.entries.single().entryId, loaded.payload.entries.single().entryId)
+		assertEquals(created.payload.entries.single().items.single().itemId, loaded.payload.entries.single().items.single().itemId)
 		assertEquals(now, loaded.createdAt)
 		assertEquals(
 			"object",
@@ -128,14 +125,11 @@ class DailyPersistenceIntegrationTest @Autowired constructor(
 
 	@Test
 	fun `accepted captures finalize into persisted metrics`() {
-		val food = captureService.create(userId, date, foodInput())
-		val fields = captureService.create(
+		val food = captureService.createFromUser(userId, date, foodPayload())
+		val fields = captureService.createFromUser(
 			userId,
 			date,
-			DailyCaptureInput(
-				type = DailyCaptureType.DAILY_FIELDS,
-				fields = DailyFieldsInput(bodyWeightKg = BigDecimal("78.4")),
-			),
+			dailyFieldsPayload(bodyWeightKg = BigDecimal("78.4")),
 		)
 		confirmationService.accept(userId, food.captureId)
 		confirmationService.accept(userId, fields.captureId)
@@ -143,7 +137,7 @@ class DailyPersistenceIntegrationTest @Autowired constructor(
 		val finalized = finalizationService.finalizeDay(userId, date)
 		val persisted = metrics.findByDayId(finalized.dayId)!!
 
-		assertEquals(150, persisted.totalCalories)
+		assertEquals(BigDecimal("150"), persisted.totalCalories)
 		assertEquals(BigDecimal("78.4"), persisted.bodyWeightKg)
 		assertEquals(2, persisted.generatedFromCaptureIds.size)
 		assertEquals(DailyCaptureStatus.ACCEPTED, captures.findById(food.captureId)?.status)
@@ -157,26 +151,19 @@ class DailyPersistenceIntegrationTest @Autowired constructor(
 		)
 	}
 
-	private fun foodInput() = DailyCaptureInput(
-		type = DailyCaptureType.FOOD,
-		meals = listOf(
-			MealInput(
-				mealTempId = "breakfast",
-				mealName = "colazione",
-				items = listOf(
-					MealItemInput(
-						itemTempId = "oats",
-						foodName = "avena",
-						quantity = BigDecimal("40"),
-						unit = "g",
-						calories = 150,
-						proteinG = BigDecimal("5"),
-						carbsG = BigDecimal("27"),
-						fatG = BigDecimal("3"),
-					),
-				),
+	private fun foodPayload() = dailyFoodPayload(
+		items = listOf(
+			manualNutritionItem(
+				foodName = "avena",
+				quantity = BigDecimal("40"),
+				unit = DailyFoodQuantityUnit.GRAM,
+				calories = BigDecimal("150"),
+				protein = BigDecimal("5"),
+				carbohydrates = BigDecimal("27"),
+				fat = BigDecimal("3"),
 			),
 		),
+		mealLabel = "colazione",
 	)
 
 	companion object {

@@ -15,7 +15,7 @@ data class MealItemDraft(
 	val foodName: String,
 	val quantity: BigDecimal,
 	val unit: String,
-	val calories: Int? = null,
+	val calories: BigDecimal? = null,
 	val proteinG: BigDecimal? = null,
 	val carbsG: BigDecimal? = null,
 	val fatG: BigDecimal? = null,
@@ -28,7 +28,7 @@ data class MealItemDraft(
 		require(quantity > BigDecimal.ZERO) { "Food quantity must be greater than zero" }
 		require(quantity <= BigDecimal("1000000")) { "Food quantity is outside the allowed range" }
 		require(unit in ALLOWED_UNITS) { "Unsupported food unit: $unit" }
-		require(calories == null || calories in 0..100_000) { "Calories are outside the allowed range" }
+		require(calories.isNullOrInRange(BigDecimal("100000"))) { "Calories are outside the allowed range" }
 		require(proteinG.isNullOrInRange(MAX_MACRO_GRAMS)) { "Protein is outside the allowed range" }
 		require(carbsG.isNullOrInRange(MAX_MACRO_GRAMS)) { "Carbohydrates are outside the allowed range" }
 		require(fatG.isNullOrInRange(MAX_MACRO_GRAMS)) { "Fat is outside the allowed range" }
@@ -106,8 +106,17 @@ data class DailyCapturePayload(
 	val meals: List<MealDraft> = emptyList(),
 	val fields: DailyFields = DailyFields(),
 	val note: String? = null,
+	val schemaVersion: Int = DAILY_CAPTURE_SCHEMA_VERSION,
+	val entries: List<DailyCaptureEntry> = emptyList(),
 ) {
 	init {
+		require(schemaVersion == DAILY_CAPTURE_SCHEMA_VERSION) {
+			"Unsupported daily capture payload schema version: $schemaVersion"
+		}
+		val projection = projectDailyCaptureEntries(entries)
+		require(type == projection.type && meals == projection.meals && fields == projection.fields && note == projection.note) {
+			"Typed capture entries and derived projection are inconsistent"
+		}
 		require(meals.size <= 50) { "A capture cannot contain more than 50 meals" }
 		require(meals.map { it.mealTempId }.distinct().size == meals.size) {
 			"Meal references must be unique within a capture"
@@ -135,22 +144,18 @@ data class DailyCapturePayload(
 		}
 	}
 
-	fun updateFoodItem(itemTempId: String, quantity: BigDecimal, unit: String): DailyCapturePayload {
-		var matches = 0
-		val updatedMeals = meals.map { meal ->
-			meal.copy(
-				items = meal.items.map { item ->
-					if (item.itemTempId == itemTempId) {
-						matches += 1
-						item.copy(quantity = quantity, unit = unit)
-					} else {
-						item
-					}
-				},
+	companion object {
+		fun fromEntries(entries: List<DailyCaptureEntry>): DailyCapturePayload {
+			val projection = projectDailyCaptureEntries(entries)
+			return DailyCapturePayload(
+				type = projection.type,
+				meals = projection.meals,
+				fields = projection.fields,
+				note = projection.note,
+				schemaVersion = DAILY_CAPTURE_SCHEMA_VERSION,
+				entries = entries,
 			)
 		}
-		require(matches == 1) { "Food item reference was not found or is ambiguous" }
-		return copy(meals = updatedMeals)
 	}
 }
 

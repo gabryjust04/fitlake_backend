@@ -1,10 +1,8 @@
 package com.fitlake.daily.infrastructure.persistence.mapper
 
+import com.fitlake.daily.application.capture.DailyCapturePayloadCodec
 import com.fitlake.daily.domain.capture.DailyCapture
 import com.fitlake.daily.domain.capture.DailyCaptureId
-import com.fitlake.daily.domain.capture.DailyCapturePayload
-import com.fitlake.daily.domain.capture.DailyCaptureType
-import com.fitlake.daily.domain.capture.DailyFields
 import com.fitlake.daily.domain.capture.MealDraft
 import com.fitlake.daily.domain.capture.MealItemDraft
 import com.fitlake.daily.domain.common.DailyDay
@@ -53,7 +51,7 @@ class DailyPersistenceMapper {
 		sourceEventId = entity.sourceEventId,
 		captureType = entity.captureType,
 		status = entity.status,
-		payload = entity.payload.toPayload(),
+		payload = DailyCapturePayloadCodec.decode(entity.payload),
 		confidence = entity.confidence,
 		createdBy = entity.createdBy,
 		updatedBy = entity.updatedBy,
@@ -73,7 +71,7 @@ class DailyPersistenceMapper {
 		sourceEventId = domain.sourceEventId,
 		captureType = domain.captureType,
 		status = domain.status,
-		payload = domain.payload.toMap(),
+		payload = DailyCapturePayloadCodec.encode(domain.payload),
 		confidence = domain.confidence,
 		createdBy = domain.createdBy,
 		updatedBy = domain.updatedBy,
@@ -140,20 +138,6 @@ class DailyPersistenceMapper {
 		updatedAt = domain.updatedAt,
 	)
 
-	private fun DailyCapturePayload.toMap(): Map<String, Any?> = linkedMapOf(
-		"type" to type.name,
-		"meals" to meals.map { it.toMap() },
-		"fields" to fields.toMap(),
-		"note" to note,
-	)
-
-	private fun Map<String, Any?>.toPayload(): DailyCapturePayload = DailyCapturePayload(
-		type = DailyCaptureType.valueOf(string("type")),
-		meals = listOfMaps("meals").map { it.toMeal() },
-		fields = map("fields").toFields(),
-		note = nullableString("note"),
-	)
-
 	private fun MealDraft.toMap(): Map<String, Any?> = linkedMapOf(
 		"mealTempId" to mealTempId,
 		"mealName" to mealName,
@@ -182,34 +166,10 @@ class DailyPersistenceMapper {
 		foodName = string("foodName"),
 		quantity = decimal("quantity") ?: error("Missing food quantity"),
 		unit = string("unit"),
-		calories = int("calories"),
+		calories = decimal("calories"),
 		proteinG = decimal("proteinG"),
 		carbsG = decimal("carbsG"),
 		fatG = decimal("fatG"),
-	)
-
-	private fun DailyFields.toMap(): Map<String, Any?> = linkedMapOf(
-		"bodyWeightKg" to bodyWeightKg,
-		"sleepHours" to sleepHours,
-		"stepsCount" to stepsCount,
-		"hydrationLiters" to hydrationLiters,
-		"caffeineMg" to caffeineMg,
-		"moodLevel" to moodLevel,
-		"focusLevel" to focusLevel,
-		"stressLevel" to stressLevel,
-		"dailyNotes" to dailyNotes,
-	)
-
-	private fun Map<String, Any?>.toFields(): DailyFields = DailyFields(
-		bodyWeightKg = decimal("bodyWeightKg"),
-		sleepHours = decimal("sleepHours"),
-		stepsCount = int("stepsCount"),
-		hydrationLiters = decimal("hydrationLiters"),
-		caffeineMg = int("caffeineMg"),
-		moodLevel = int("moodLevel"),
-		focusLevel = int("focusLevel"),
-		stressLevel = int("stressLevel"),
-		dailyNotes = nullableString("dailyNotes"),
 	)
 
 	private fun Map<String, Any?>.string(key: String): String =
@@ -224,17 +184,6 @@ class DailyPersistenceMapper {
 		is String -> value.toBigDecimal()
 		else -> error("Invalid numeric JSON field: $key")
 	}
-
-	private fun Map<String, Any?>.int(key: String): Int? = when (val value = this[key]) {
-		null -> null
-		is Number -> value.toInt()
-		is String -> value.toInt()
-		else -> error("Invalid integer JSON field: $key")
-	}
-
-	@Suppress("UNCHECKED_CAST")
-	private fun Map<String, Any?>.map(key: String): Map<String, Any?> =
-		this[key] as? Map<String, Any?> ?: emptyMap()
 
 	@Suppress("UNCHECKED_CAST")
 	private fun Map<String, Any?>.listOfMaps(key: String): List<Map<String, Any?>> =

@@ -28,9 +28,21 @@ interface SpringDataDailyDayRepository : JpaRepository<DailyDayEntity, UUID> {
 }
 
 interface SpringDataDailyCaptureRepository : JpaRepository<DailyCaptureEntity, UUID> {
+	fun findByCaptureIdAndUserId(captureId: UUID, userId: UUID): DailyCaptureEntity?
+
 	@Lock(LockModeType.PESSIMISTIC_WRITE)
 	@Query("select capture from DailyCaptureEntity capture where capture.captureId = :captureId")
 	fun findByCaptureIdForUpdate(@Param("captureId") captureId: UUID): DailyCaptureEntity?
+
+	@Lock(LockModeType.PESSIMISTIC_WRITE)
+	@Query(
+		"select capture from DailyCaptureEntity capture " +
+			"where capture.captureId = :captureId and capture.userId = :userId",
+	)
+	fun findByCaptureIdAndUserIdForUpdate(
+		@Param("captureId") captureId: UUID,
+		@Param("userId") userId: UUID,
+	): DailyCaptureEntity?
 
 	fun findBySourceEventId(sourceEventId: UUID): DailyCaptureEntity?
 

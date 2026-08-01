@@ -55,7 +55,7 @@ docker run --name fitlake-postgres `
   -d postgres:16-alpine
 ```
 
-Flyway runs automatically at application startup. `V1__initialize_fitlake_daily_schema.sql` creates the seven original Daily tables, `V2__add_firebase_auth_identity.sql` adds `user_auth_identity`, `V3__add_daily_ai_message_audit.sql` adds the AI reprocess link, processing lease, and database idempotency constraints, and `V4__add_private_user_food_catalog.sql` adds `user_food`, `user_food_alias`, and their search indexes. Hibernate only validates the migrated schema (`ddl-auto=validate`).
+Flyway runs automatically at application startup. `V1__initialize_fitlake_daily_schema.sql` creates the seven original Daily tables, `V2__add_firebase_auth_identity.sql` adds `user_auth_identity`, `V3__add_daily_ai_message_audit.sql` adds the AI reprocess link, processing lease, and database idempotency constraints, `V4__add_private_user_food_catalog.sql` adds `user_food`, `user_food_alias`, and their search indexes, and `V5__add_daily_capture_content_audit.sql` adds owner-safe capture audit rows and changes finalized calories to `NUMERIC(18,6)`. Hibernate only validates the migrated schema (`ddl-auto=validate`).
 
 V4 enables PostgreSQL's `pg_trgm` extension with `CREATE EXTENSION IF NOT EXISTS pg_trgm`. The PostgreSQL installation must provide that extension and the migration role must be allowed to enable it. The official PostgreSQL Docker images used by local development and Testcontainers include it.
 
@@ -159,7 +159,7 @@ List size is limited to `1..100`; available sorts are `NAME_ASC`, `CREATED_AT_DE
 
 Supported units are `GRAM`, `KILOGRAM`, `MILLILITER`, `LITER`, `PIECE`, and `SERVING`. Nutrition is always expressed for an explicit `nutritionBasis`. An optional `defaultServing` is separate from that basis. Cross-category conversions are allowed only when the matching positive conversion is explicitly supplied through `gramsPerPiece`, `millilitersPerPiece`, `gramsPerServing`, or `millilitersPerServing`; no arbitrary conversion is inferred.
 
-Nutrients use decimal values and may include calories, protein, carbohydrates, fat, fiber, sugars, saturated fat, sodium, and salt. A `null` nutrient means **unknown**, never zero. Source types are `USER_ENTERED`, `PRODUCT_LABEL`, `EXTERNAL_DATABASE`, `AI_ESTIMATE`, and `IMPORTED`; these values are metadata only and do not trigger an external provider or AI call.
+Nutrients use decimal values and may include calories, protein, carbohydrates, fat, fiber, sugars, saturated fat, sodium, and salt. A `null` nutrient means **unknown**, never zero. Catalog source types are `USER_ENTERED`, `PRODUCT_LABEL`, `EXTERNAL_DATABASE`, `AI_ESTIMATE`, and `IMPORTED`; these values are metadata only and do not trigger an external provider or AI call. A catalog definition whose provenance is `AI_ESTIMATE` is distinct from a Daily capture item whose runtime `sourceType` is `AI_ESTIMATE`.
 
 Create a product-label food expressed per 100 grams with a 170-gram default serving:
 
@@ -254,7 +254,9 @@ Deletion sets `deleted_at` and returns `204`; the food and its aliases then disa
 
 Invalid definitions and query parameters return `400`, inaccessible foods return `404`, and active barcode or alias conflicts return `409`, using the API's standard safe error body.
 
-The catalog is deliberately not connected to Daily yet. When that integration is added, each consumed item must store both a `userFoodId` reference and an immutable snapshot of the food name, consumed amount/unit, nutrition values, and source used at that time. Later edits or deletion of the catalog definition must never rewrite historical Daily captures.
+The catalog participates in two read-only Daily paths. Manual typed input uses the exact, ownership-scoped `userFoodId` selected by the frontend; it never matches by name. Natural-language AI insertion may ask the backend to resolve the extracted food name against the authenticated user's active catalog, but only an exact normalized name or alias that identifies one food is accepted automatically. Prefix and fuzzy results are never used by the AI path. Neither path creates or updates catalog definitions.
+
+Each matched consumed item stores its `userFoodId` and an immutable snapshot of the food definition used for calculation. Later edits or soft deletion of the reusable catalog definition never rewrite or break an existing capture.
 
 ## Daily REST API
 
@@ -265,16 +267,90 @@ All Daily routes require the same Firebase bearer token used by `/api/me`.
 | `POST` | `/api/daily/days/{date}/captures` | Create a manual `OPEN` capture and create the day if needed |
 | `POST` | `/api/daily/days/{date}/messages` | Interpret one complete standalone message through AI |
 | `GET` | `/api/daily/days/{date}` | Read the day, all captures, and finalized metrics when present |
+| `GET` | `/api/daily/days/{date}/captures` | List all captures for one owned day |
+| `GET` | `/api/daily/captures/{captureId}` | Read one owned capture |
 | `POST` | `/api/daily/captures/{captureId}/accept` | Accept an open capture |
 | `POST` | `/api/daily/captures/{captureId}/reject` | Reject an open capture |
-| `PUT` | `/api/daily/captures/{captureId}` | Replace an open or accepted capture payload |
-| `PATCH` | `/api/daily/captures/{captureId}/food-items/{itemTempId}` | Change a food item's quantity and unit |
+| `PUT` | `/api/daily/captures/{captureId}` | Atomically replace the complete v2 capture using optimistic locking |
 | `DELETE` | `/api/daily/captures/{captureId}` | Soft delete a capture without removing its database row |
 | `POST` | `/api/daily/captures/{captureId}/reprocess` | Reinterpret complete replacement text for an `OPEN` proposal |
 | `POST` | `/api/daily/days/{date}/finalize` | Build metrics from accepted captures and confirm the day |
+| `POST` | `/api/daily/days/{date}/reopen` | Reopen a confirmed day so it can be changed and recalculated |
 | `GET` | `/api/daily/days/{date}/metrics` | Read the finalized metrics snapshot |
 
 Dates use ISO format: `YYYY-MM-DD`.
+
+### Manual Daily captures linked to personal foods
+
+The frontend workflow is deterministic and does not invoke AI:
+
+```text
+GET /api/me/foods/search?query=...
+→ user selects one exact userFoodId
+→ POST or PUT the complete v2 Daily capture
+→ backend loads that active food for the authenticated internal UserId
+→ backend converts units, calculates nutrients, and stores a snapshot
+```
+
+One manual submission creates one capture. A `FOOD` entry can contain multiple selected foods, and the same capture can also contain scalar entries such as `WEIGHT`, `HYDRATION`, or `SLEEP`. Food-only content is classified as `FOOD`, scalar-only content as `DAILY_FIELDS`, food plus scalar fields as `MIXED`, and note-only content as `NOTE`.
+
+Create one mixed capture using an exact personal-food ID and a saved default serving:
+
+```powershell
+curl.exe -X POST "http://localhost:8080/api/daily/days/2026-07-31/captures" `
+  -H "Authorization: Bearer <FIREBASE_ID_TOKEN>" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "entries":[
+      {
+        "type":"FOOD",
+        "mealType":"DINNER",
+        "items":[{
+          "sourceType":"USER_FOOD",
+          "userFoodId":"2db702d6-aeeb-46be-b863-72d552de63ab",
+          "quantity":{"amount":1,"unit":"DEFAULT_SERVING"}
+        }]
+      },
+      {"type":"WEIGHT","value":78,"unit":"KILOGRAM"},
+      {"type":"HYDRATION","value":750,"unit":"MILLILITER"}
+    ]
+  }'
+```
+
+Food quantities support `GRAM`, `KILOGRAM`, `MILLILITER`, `LITER`, `PIECE`, `SERVING`, and `DEFAULT_SERVING`. Kilograms/grams and liters/milliliters convert directly. Piece or serving conversion is allowed only through the selected food's explicit `gramsPerPiece`, `millilitersPerPiece`, `gramsPerServing`, or `millilitersPerServing`. `DEFAULT_SERVING` requires a saved default serving and accepts a positive multiplier. Mass is never guessed from volume, and missing conversion metadata returns `400`.
+
+Calculations use `BigDecimal`, internal `DECIMAL128` precision, and persist item results at scale 6 with `HALF_UP`. A missing nutrient remains `null`; it is not converted to zero. Responses expose the entered quantity, canonical resolved quantity, basis, all nutrients per basis, conversion/default-serving metadata, nutrition source, catalog version/update time, calculated item values, and entry totals.
+
+All manual and AI capture payloads use `schemaVersion: 2` and authoritative typed `entries`. Payloads without `schemaVersion`, version 1, and unknown future versions are rejected. FitLake is still in development, so there is no v1 compatibility layer or destructive data migration: an existing development database containing v1 `daily_capture.payload` or v1 AI audit snapshots must be recreated before using this version.
+
+Full replacement requires the currently returned capture version:
+
+```powershell
+curl.exe -X PUT "http://localhost:8080/api/daily/captures/<CAPTURE_ID>" `
+  -H "Authorization: Bearer <FIREBASE_ID_TOKEN>" `
+  -H "X-Request-ID: mobile-edit-0194" `
+  -H "Content-Type: application/json" `
+  -d '{
+    "version":0,
+    "entries":[{
+      "entryId":"<EXISTING_ENTRY_UUID>",
+      "type":"FOOD",
+      "mealType":"DINNER",
+      "items":[{
+        "itemId":"<EXISTING_ITEM_UUID>",
+        "sourceType":"USER_FOOD",
+        "userFoodId":"2db702d6-aeeb-46be-b863-72d552de63ab",
+        "quantity":{"amount":200,"unit":"GRAM"}
+      }]
+    }]
+  }'
+```
+
+The `entries` array is the entire new editable content: omitted entries and items are removed. Existing entry/item UUIDs must already belong to this target capture; omitted UUIDs are generated by the backend. An unchanged linked item preserves its original snapshot. A quantity-only edit recalculates from that same snapshot, even if the catalog food has since changed or been deleted. A new item or changed `userFoodId` loads the current active owned definition and creates a new snapshot; a deleted/foreign food is ownership-safely `404`.
+
+An existing `AI_ESTIMATE` item has stricter replacement rules. The full `PUT` may preserve it unchanged by resending its existing item ID, `AI_ESTIMATE` source, and original quantity, or remove it by omission. The client cannot create a new `AI_ESTIMATE`, change its quantity or nutrition, or change its source. To correct an estimated item, submit complete replacement text through the AI reprocess endpoint.
+
+`PUT /api/daily/captures/{captureId}` is the only capture-update endpoint. It uses one transaction for validation, scoped food resolution, calculation, payload persistence, version increment, and a `UI_EDIT` audit row containing old/new payloads and versions. A stale version returns `409` and changes nothing. `OPEN` remains `OPEN`; `ACCEPTED` remains `ACCEPTED`. Rejected, soft-deleted, expired, and captures on a `CONFIRMED` day cannot be edited. After a day is `REOPENED`, its accepted captures are editable and the next finalization recalculates the metrics snapshot.
 
 Example manual daily-fields capture:
 
@@ -286,46 +362,23 @@ Content-Type: application/json
 
 ```json
 {
-  "type": "DAILY_FIELDS",
-  "fields": {
-    "bodyWeightKg": 78.4,
-    "sleepHours": 7.5,
-    "stepsCount": 8500,
-    "hydrationLiters": 2.2,
-    "moodLevel": 8
-  }
-}
-```
-
-Example food capture:
-
-```json
-{
-  "type": "FOOD",
-  "meals": [
-    {
-      "mealName": "colazione",
-      "items": [
-        {
-          "foodName": "avena",
-          "quantity": 40,
-          "unit": "g",
-          "calories": 150,
-          "proteinG": 5,
-          "carbsG": 27,
-          "fatG": 3
-        }
-      ]
-    }
+  "entries": [
+    {"type":"WEIGHT","value":78.4,"unit":"KILOGRAM"},
+    {"type":"SLEEP","value":7.5,"unit":"HOUR"},
+    {"type":"STEPS","value":8500,"unit":"COUNT"},
+    {"type":"HYDRATION","value":2.2,"unit":"LITER"},
+    {"type":"MOOD","value":8,"unit":"LEVEL"}
   ]
 }
 ```
 
-`mealTempId` and `itemTempId` may be supplied by the client for deterministic UI references; when omitted, the backend generates them. Supported units are `g`, `kg`, `ml`, `l`, `unit`, and `portion`, with common Italian aliases normalized automatically.
+Entry and item UUIDs are generated by the backend when omitted. Existing IDs can only be reused when they already belong to the target capture.
 
 Every manual capture starts as `OPEN`. It must be accepted or rejected before finalization. An `OPEN` capture causes finalization to return `409 Conflict`. Only `ACCEPTED` captures contribute to metrics; rejected, expired, and soft-deleted captures remain stored but are excluded.
 
-For repeated scalar fields such as body weight or sleep, the last non-null value in deterministic capture creation order wins. Food meals are concatenated, and provided calories/macros are summed. Calling finalization more than once returns the existing snapshot without duplicating it.
+Finalization reads every accepted capture. It concatenates food logs; sums calories, protein, carbohydrates, and fat with `BigDecimal`; and resolves body weight, sleep, steps, hydration, caffeine, mood, focus, stress, and daily notes using the last non-null value in deterministic capture creation order. If any food has an unknown value for a nutrient, that nutrient's daily total remains `null` rather than treating the unknown value as zero. Calling finalization again while the day is already `CONFIRMED` returns the existing snapshot without duplicating it.
+
+`POST /api/daily/days/{date}/reopen` changes `CONFIRMED` to `REOPENED` and marks the existing metrics snapshot `REOPENED`, making its stale state explicit. Capture creation, confirmation, full replacement, and soft deletion are then available again. A new finalization still refuses unresolved `OPEN` captures; otherwise it rebuilds metrics from the current accepted captures, updates the same `daily_metrics` row, preserves its original `createdAt`, sets `recalculatedAt`, and returns both day and metrics to `CONFIRMED`.
 
 ## Daily AI insertion
 
@@ -337,7 +390,17 @@ askClarification
 noOp
 ```
 
-Only `createCapture` reaches the normal application capture use case. The authenticated user, date, day, IDs, ownership, `OPEN` status, and timestamps always come from the backend. The model cannot call repositories or write to PostgreSQL. A versioned prompt lives at `src/main/resources/prompts/daily-capture-v1.txt`.
+Only `createCapture` reaches the normal application capture use case. The authenticated user, date, day, IDs, ownership, `OPEN` status, and timestamps always come from the backend. The model cannot call repositories, inspect the catalog, or write to PostgreSQL. The active versioned prompt is `src/main/resources/prompts/daily-capture-v2.txt`.
+
+For every extracted food item, the model must return `calories`, `proteinG`, `carbsG`, and `fatG` as non-negative decimal estimates for the complete consumed quantity. These four values are mandatory even when a personal-food match is likely because they are the backend fallback.
+
+The backend then resolves each item independently:
+
+1. Normalize the extracted name and look only for exact active name or alias matches owned by the authenticated user.
+2. If exactly one food matches, all four core catalog nutrients are present, and the entered unit can be converted deterministically, calculate from the immutable catalog snapshot and store the item as `USER_FOOD`. These calculated values replace the AI estimate.
+3. If there is no exact match, more than one exact match, incomplete core catalog nutrition, or no valid unit conversion, store the complete model-provided quartet as `AI_ESTIMATE`.
+
+The backend never combines individual nutrients from the catalog and AI in one item, never coerces a missing catalog nutrient to zero, and never uses prefix or fuzzy matching for automatic AI resolution. The original estimate and the resolution outcome are retained in the AI audit. An `AI_ESTIMATE` has no `userFoodId` or catalog snapshot, does not create or update a personal food, and remains an `OPEN` proposal requiring normal user confirmation.
 
 Every request requires a client-generated `Idempotency-Key` header, unique for that complete operation. Retrying the same key with the same normalized text replays the original terminal result without another model call or duplicate capture. Reusing the key for different text returns `409`. An interrupted `PROCESSING` event can be recovered after its five-minute processing lease expires; a per-attempt fencing token prevents the expired worker from committing afterward.
 
@@ -365,10 +428,30 @@ A successful `createCapture` returns `201` and an `OPEN` capture. Abbreviated re
     "status": "OPEN",
     "createdBy": "AI",
     "payload": {
-      "type": "FOOD",
-      "meals": [],
-      "fields": {},
-      "note": null
+      "schemaVersion": 2,
+      "entries": [
+        {
+          "entryId": "3a3644fc-2c37-4578-bad0-c93722f47462",
+          "type": "FOOD",
+          "mealLabel": "colazione",
+          "items": [
+            {
+              "itemId": "e78868dc-6cd0-4bc4-9e60-794889fc4227",
+              "sourceType": "AI_ESTIMATE",
+              "userFoodId": null,
+              "displayName": "banana",
+              "enteredQuantity": {"amount": 1, "unit": "PIECE"},
+              "resolvedQuantity": {"amount": 1, "unit": "PIECE"},
+              "calculatedNutrition": {
+                "caloriesKcal": 105,
+                "proteinGrams": 1.3,
+                "carbohydratesGrams": 27,
+                "fatGrams": 0.4
+              }
+            }
+          ]
+        }
+      ]
     }
   }
 }
@@ -411,7 +494,7 @@ $env:JAVA_HOME='C:\path\to\jdk-25'
 .\gradlew.bat test
 ```
 
-The suite includes Daily domain/use-case tests, offline Spring AI tool-calling tests, authenticated REST tests, private-food domain/CRUD/isolation/search tests, filter and MVC security tests with a fake token verifier, and PostgreSQL/Flyway/JSONB/`pg_trgm` persistence, rollback, and concurrency tests through Testcontainers. No real Firebase or AI credentials and no provider network calls are used. PostgreSQL integration tests are skipped when Docker is unavailable.
+The suite includes Daily domain/use-case tests, offline Spring AI tool-calling and nutrition-fallback tests, exact/ambiguous user-food matching tests, authenticated REST tests, private-food domain/CRUD/isolation/search tests, filter and MVC security tests with a fake token verifier, and PostgreSQL/Flyway/JSONB/`pg_trgm` persistence, rollback, and concurrency tests through Testcontainers. No real Firebase or AI credentials and no provider network calls are used. PostgreSQL integration tests are skipped when Docker is unavailable.
 
 ## Current deliberate limits
 
@@ -419,6 +502,6 @@ The suite includes Daily domain/use-case tests, offline Spring AI tool-calling t
 - One Firebase issuer may map to only one identity per internal user.
 - A Firebase email claim is stored even when unverified and is synchronized when it changes on later logins. A missing claim does not erase the stored value, and email is never used for account resolution or merging.
 - Display name seeds the profile on first login but later token changes do not overwrite user-managed profile data.
-- Personal foods are manually managed and private; automatic creation, barcode lookup, external nutrition lookup, and integration with AI or Daily captures are not implemented.
+- Personal foods remain manually managed and private; automatic creation, barcode lookup, and external nutrition lookup are not implemented. Manual Daily linking uses an exact `userFoodId`. Natural-language insertion can only read an exact, unique active name/alias match for the authenticated user; it never uses fuzzy matching and never creates or updates catalog data.
 - Soft-deleted personal foods cannot currently be restored through the API.
 - Account linking, account deletion, authorization roles, Telegram, conversational memory, relative AI edits, and AI-driven finalization remain future work.

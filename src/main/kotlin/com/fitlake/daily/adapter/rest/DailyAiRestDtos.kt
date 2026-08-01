@@ -60,39 +60,7 @@ fun DailyAiResult.toResponse(): DailyAiMessageResponse = when (this) {
 				date = date,
 				type = capture.captureType,
 				status = capture.status,
-				payload = DailyCapturePayloadResponse(
-					type = capture.payload.type,
-					meals = capture.payload.meals.map { meal ->
-						MealResponse(
-							mealTempId = meal.mealTempId,
-							mealName = meal.mealName,
-							items = meal.items.map { item ->
-								MealItemResponse(
-									itemTempId = item.itemTempId,
-									foodName = item.foodName,
-									quantity = item.quantity,
-									unit = item.unit,
-									calories = item.calories,
-									proteinG = item.proteinG,
-									carbsG = item.carbsG,
-									fatG = item.fatG,
-								)
-							},
-						)
-					},
-					fields = DailyFieldsResponse(
-						bodyWeightKg = capture.payload.fields.bodyWeightKg,
-						sleepHours = capture.payload.fields.sleepHours,
-						stepsCount = capture.payload.fields.stepsCount,
-						hydrationLiters = capture.payload.fields.hydrationLiters,
-						caffeineMg = capture.payload.fields.caffeineMg,
-						moodLevel = capture.payload.fields.moodLevel,
-						focusLevel = capture.payload.fields.focusLevel,
-						stressLevel = capture.payload.fields.stressLevel,
-						dailyNotes = capture.payload.fields.dailyNotes,
-					),
-					note = capture.payload.note,
-				),
+				payload = capture.payload.toResponse(),
 				createdBy = capture.createdBy,
 				createdAt = capture.createdAt,
 				version = capture.version,

@@ -22,7 +22,7 @@ data class DailyMetrics(
 	val moodLevel: Int?,
 	val focusLevel: Int?,
 	val stressLevel: Int?,
-	val totalCalories: Int?,
+	val totalCalories: BigDecimal?,
 	val proteinG: BigDecimal?,
 	val carbsG: BigDecimal?,
 	val fatG: BigDecimal?,
@@ -34,4 +34,12 @@ data class DailyMetrics(
 	val recalculatedAt: Instant?,
 	val createdAt: Instant,
 	val updatedAt: Instant,
-)
+) {
+	fun markReopened(at: Instant): DailyMetrics {
+		check(status == DailyDayStatus.CONFIRMED) { "Only confirmed metrics can be marked as reopened" }
+		return copy(
+			status = DailyDayStatus.REOPENED,
+			updatedAt = maxOf(updatedAt, at),
+		)
+	}
+}

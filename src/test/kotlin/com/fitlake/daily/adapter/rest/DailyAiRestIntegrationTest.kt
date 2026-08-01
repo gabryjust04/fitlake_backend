@@ -13,11 +13,13 @@ import com.fitlake.daily.application.ai.AiCaptureProposal
 import com.fitlake.daily.application.ai.AiFoodItemProposal
 import com.fitlake.daily.application.ai.AiMealProposal
 import com.fitlake.daily.application.ai.DailyAiAuditService
+import com.fitlake.daily.application.ai.DailyAiCaptureProposalFactory
 import com.fitlake.daily.application.ai.DailyAiMessageService
 import com.fitlake.daily.application.ai.DailyAiProviderUnavailableException
 import com.fitlake.daily.application.ai.DailyAiTerminalService
 import com.fitlake.daily.application.capture.DailyCaptureService
-import com.fitlake.daily.application.capture.DailyPayloadFactory
+import com.fitlake.daily.application.port.DailyAiUserFoodMatchPort
+import com.fitlake.daily.application.port.DailyAiUserFoodMatchResult
 import com.fitlake.daily.domain.capture.DailyCaptureId
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.support.DailyAiScript
@@ -101,8 +103,15 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 			jsonPath("$.capture.status") { value("OPEN") }
 			jsonPath("$.capture.createdBy") { value("AI") }
 			jsonPath("$.capture.type") { value("FOOD") }
-			jsonPath("$.capture.payload.meals[0].items[0].foodName") { value("avena") }
-			jsonPath("$.capture.payload.meals[0].items[0].itemTempId") { isNotEmpty() }
+			jsonPath("$.capture.payload.entries[0].items[0].displayName") { value("avena") }
+			jsonPath("$.capture.payload.entries[0].items[0].itemId") { isNotEmpty() }
+			jsonPath("$.capture.payload.schemaVersion") { value(2) }
+			jsonPath("$.capture.payload.entries[0].items[0].sourceType") { value("AI_ESTIMATE") }
+			jsonPath("$.capture.payload.entries[0].items[0].userFoodId") { doesNotExist() }
+			jsonPath("$.capture.payload.entries[0].items[0].calculatedNutrition.caloriesKcal") { value(150) }
+			jsonPath("$.capture.payload.entries[0].items[0].calculatedNutrition.proteinGrams") { value(5) }
+			jsonPath("$.capture.payload.entries[0].items[0].calculatedNutrition.carbohydratesGrams") { value(27) }
+			jsonPath("$.capture.payload.entries[0].items[0].calculatedNutrition.fatGrams") { value(3) }
 		}
 		val captureId = captureId(first.andReturn().response.contentAsString)
 
@@ -227,7 +236,7 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 			jsonPath("$.replacedCaptureId") { value(oldId) }
 			jsonPath("$.capture.captureId") { value(org.hamcrest.Matchers.not(oldId)) }
 			jsonPath("$.capture.status") { value("OPEN") }
-			jsonPath("$.capture.payload.meals[0].items[0].foodName") { value("biscotti") }
+			jsonPath("$.capture.payload.entries[0].items[0].displayName") { value("biscotti") }
 		}
 		val newId = captureId(replacement.andReturn().response.contentAsString)
 
@@ -326,6 +335,10 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 						foodName = foodName,
 						quantity = BigDecimal("40"),
 						unit = "g",
+						calories = BigDecimal("150"),
+						proteinG = BigDecimal("5"),
+						carbsG = BigDecimal("27"),
+						fatG = BigDecimal("3"),
 					),
 				),
 			),
@@ -356,7 +369,6 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 		SecurityCurrentUserProvider::class,
 		DailyAiController::class,
 		DailyApiExceptionHandler::class,
-		DailyPayloadFactory::class,
 		DailyCaptureService::class,
 		DailyAiAuditService::class,
 		DailyAiTerminalService::class,
@@ -405,6 +417,11 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 
 		@Bean
 		fun interpreter(terminalService: DailyAiTerminalService) = ScriptedDailyAiInterpreter(terminalService)
+
+		@Bean
+		fun dailyAiCaptureProposalFactory() = DailyAiCaptureProposalFactory(
+			DailyAiUserFoodMatchPort { _, _ -> DailyAiUserFoodMatchResult.None },
+		)
 
 		@Bean
 		fun transactionExecutor() = ImmediateTransactionExecutor

@@ -4,6 +4,7 @@ import com.fitlake.daily.application.port.DailyCaptureRepository
 import com.fitlake.daily.application.port.DailyDayRepository
 import com.fitlake.daily.application.port.DailyMetricsRepository
 import com.fitlake.daily.domain.capture.DailyCapture
+import com.fitlake.daily.domain.capture.DailyCaptureId
 import com.fitlake.daily.domain.common.DailyDay
 import com.fitlake.daily.domain.metrics.DailyMetrics
 import com.fitlake.user.domain.UserId
@@ -22,6 +23,15 @@ class DailyQueryService(
 	private val captureRepository: DailyCaptureRepository,
 	private val metricsRepository: DailyMetricsRepository,
 ) {
+	fun getCapture(userId: UserId, captureId: DailyCaptureId): DailyCapture =
+		captureRepository.findByIdAndUserId(captureId, userId)
+			?: throw DailyNotFoundException.capture(captureId.value)
+
+	fun getCaptures(userId: UserId, date: LocalDate): List<DailyCapture> {
+		val day = dayRepository.findByUserIdAndDate(userId, date) ?: throw DailyNotFoundException.day(date)
+		return captureRepository.findAllByUserIdAndDayId(userId, day.dayId)
+	}
+
 	fun getDay(userId: UserId, date: LocalDate): DailyDayView {
 		val day = dayRepository.findByUserIdAndDate(userId, date) ?: throw DailyNotFoundException.day(date)
 		return DailyDayView(

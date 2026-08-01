@@ -4,11 +4,7 @@ import com.fitlake.daily.application.DailyConflictException
 import com.fitlake.daily.application.DailyNotFoundException
 import com.fitlake.daily.application.DailyStateCorruptionException
 import com.fitlake.daily.application.DailyValidationException
-import com.fitlake.daily.application.capture.DailyCaptureInput
 import com.fitlake.daily.application.capture.DailyCaptureService
-import com.fitlake.daily.application.capture.DailyFieldsInput
-import com.fitlake.daily.application.capture.MealInput
-import com.fitlake.daily.application.capture.MealItemInput
 import com.fitlake.daily.application.port.AiInterpretationLogRepository
 import com.fitlake.daily.application.port.DailyCaptureRepository
 import com.fitlake.daily.application.port.DailyDayRepository
@@ -18,7 +14,6 @@ import com.fitlake.daily.domain.ai.AiInterpretationLogId
 import com.fitlake.daily.domain.ai.AiInterpretationStatus
 import com.fitlake.daily.domain.capture.DailyCapture
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
-import com.fitlake.daily.domain.capture.DailyCaptureType
 import com.fitlake.daily.domain.common.DailyDayStatus
 import com.fitlake.daily.domain.inbox.DailyInboxEvent
 import com.fitlake.daily.domain.inbox.DailyInboxProcessingStatus
@@ -28,7 +23,6 @@ import org.springframework.dao.OptimisticLockingFailureException
 import org.springframework.stereotype.Service
 import java.math.BigDecimal
 import java.time.Clock
-import java.util.Locale
 import java.util.UUID
 
 @Service
@@ -38,14 +32,14 @@ class DailyAiTerminalService(
 	private val inboxEventRepository: DailyInboxEventRepository,
 	private val interpretationLogRepository: AiInterpretationLogRepository,
 	private val captureService: DailyCaptureService,
+	private val proposalFactory: DailyAiCaptureProposalFactory,
 	private val transactionExecutor: TransactionExecutor,
 	private val clock: Clock,
 ) {
-	fun createCapture(context: DailyAiRequestContext, proposal: AiCaptureProposal): DailyAiResult {
-		val input = proposal.toCaptureInput()
+	fun createCapture(context: DailyAiRequestContext, proposal: AiCaptureProposal): DailyAiResult = persistSafely {
 		validateConfidence(proposal.confidence)
-		return persistSafely {
-			transactionExecutor.required {
+		val resolvedCapture = proposalFactory.create(context.userId, proposal)
+		transactionExecutor.required {
 				val event = requireProcessingEvent(context)
 				val day = dayRepository.findByIdForUpdate(event.dayId)
 					?: throw DailyStateCorruptionException("Daily AI event references a missing day")
@@ -72,7 +66,7 @@ class DailyAiTerminalService(
 				val created = captureService.createFromAi(
 					userId = context.userId,
 					date = context.date,
-					input = input,
+					payload = resolvedCapture.payload,
 					sourceEventId = event.inboxEventId.value,
 					confidence = proposal.confidence,
 				)
@@ -87,14 +81,14 @@ class DailyAiTerminalService(
 						capture = created,
 						confidence = proposal.confidence,
 						parsedOutput = captureResult.toAuditOutput(
-							if (previous == null) "CAPTURE_CREATED" else "CAPTURE_REPLACED",
+							outcome = if (previous == null) "CAPTURE_CREATED" else "CAPTURE_REPLACED",
+							nutritionResolutions = resolvedCapture.nutritionResolutions,
 						),
 						at = now,
 					),
 				)
 				inboxEventRepository.save(event.processed(now))
 				DailyAiResult.CaptureCreated(context.date, captureResult, previous?.captureId)
-			}
 		}
 	}
 
@@ -183,46 +177,6 @@ class DailyAiTerminalService(
 		if (capture.status != DailyCaptureStatus.OPEN) {
 			throw DailyConflictException("Only an open capture can be reprocessed")
 		}
-	}
-
-	private fun AiCaptureProposal.toCaptureInput(): DailyCaptureInput = try {
-		val captureType = type?.trim()?.uppercase(Locale.ROOT)?.let(DailyCaptureType::valueOf)
-			?: throw IllegalArgumentException("Capture type is required")
-		DailyCaptureInput(
-			type = captureType,
-			meals = meals.map { meal ->
-				MealInput(
-					mealTempId = null,
-					mealName = meal.mealName,
-					items = meal.items.map { item ->
-						MealItemInput(
-							itemTempId = null,
-							foodName = item.foodName.required("Food name"),
-							quantity = item.quantity ?: throw IllegalArgumentException("Food quantity is required"),
-							unit = item.unit.required("Food unit"),
-							calories = item.calories,
-							proteinG = item.proteinG,
-							carbsG = item.carbsG,
-							fatG = item.fatG,
-						)
-					},
-				)
-			},
-			fields = DailyFieldsInput(
-				bodyWeightKg = fields.bodyWeightKg,
-				sleepHours = fields.sleepHours,
-				stepsCount = fields.stepsCount,
-				hydrationLiters = fields.hydrationLiters,
-				caffeineMg = fields.caffeineMg,
-				moodLevel = fields.moodLevel,
-				focusLevel = fields.focusLevel,
-				stressLevel = fields.stressLevel,
-				dailyNotes = fields.dailyNotes,
-			),
-			note = note,
-		)
-	} catch (exception: IllegalArgumentException) {
-		throw DailyAiInvalidOutputException(exception)
 	}
 
 	private fun validateConfidence(confidence: BigDecimal?) {

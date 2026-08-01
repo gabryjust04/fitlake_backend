@@ -5,6 +5,7 @@ import com.fitlake.daily.application.ai.AiFoodItemProposal
 import com.fitlake.daily.application.ai.AiMealProposal
 import com.fitlake.daily.application.ai.AiNoOpProposal
 import com.fitlake.daily.application.ai.DailyAiAuditService
+import com.fitlake.daily.application.ai.DailyAiCaptureProposalFactory
 import com.fitlake.daily.application.ai.DailyAiInterpreter
 import com.fitlake.daily.application.ai.DailyAiMessageService
 import com.fitlake.daily.application.ai.DailyAiOperationInProgressException
@@ -13,15 +14,16 @@ import com.fitlake.daily.application.ai.DailyAiPreparation
 import com.fitlake.daily.application.ai.DailyAiProviderMetadata
 import com.fitlake.daily.application.ai.DailyAiResult
 import com.fitlake.daily.application.ai.DailyAiTerminalService
-import com.fitlake.daily.application.capture.DailyCaptureInput
 import com.fitlake.daily.application.capture.DailyCaptureService
-import com.fitlake.daily.application.capture.DailyFieldsInput
-import com.fitlake.daily.application.capture.DailyPayloadFactory
 import com.fitlake.daily.application.port.AiInterpretationLogRepository
+import com.fitlake.daily.application.port.DailyAiUserFoodMatchPort
+import com.fitlake.daily.application.port.DailyAiUserFoodMatchResult
 import com.fitlake.daily.domain.ai.AiInterpretationLog
 import com.fitlake.daily.domain.ai.AiInterpretationStatus
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.daily.domain.capture.DailyCaptureType
+import com.fitlake.daily.domain.capture.DailyFoodItemSourceType
+import com.fitlake.daily.domain.capture.DAILY_CAPTURE_SCHEMA_VERSION
 import com.fitlake.daily.domain.inbox.DailyInboxProcessingStatus
 import com.fitlake.daily.infrastructure.persistence.mapper.DailyAiPersistenceMapper
 import com.fitlake.daily.infrastructure.persistence.mapper.DailyPersistenceMapper
@@ -32,6 +34,7 @@ import com.fitlake.daily.infrastructure.persistence.repository.JpaDailyInboxEven
 import com.fitlake.daily.infrastructure.persistence.repository.SpringDataDailyCaptureRepository
 import com.fitlake.daily.infrastructure.persistence.repository.SpringDataDailyInboxEventRepository
 import com.fitlake.shared.application.TransactionExecutor
+import com.fitlake.support.dailyFieldsPayload
 import com.fitlake.user.domain.UserAccount
 import com.fitlake.user.domain.UserId
 import com.fitlake.user.application.UserQueryService
@@ -109,8 +112,7 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 	private val date = LocalDate.parse("2026-07-30")
 	private val clock = Clock.fixed(now, ZoneId.of("UTC"))
 	private val transactions: TransactionExecutor = SpringTransactionExecutor(transactionManager)
-	private val payloadFactory = DailyPayloadFactory()
-	private val captureService = DailyCaptureService(days, captures, payloadFactory, transactions, clock)
+	private val captureService = DailyCaptureService(days, captures, transactions, clock)
 	private val auditService = DailyAiAuditService(
 		days,
 		captures,
@@ -125,10 +127,11 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 		inboxEvents,
 		logs,
 		captureService,
+		DailyAiCaptureProposalFactory(noCatalogMatches()),
 		transactions,
 		clock,
 	)
-	private val metadata = DailyAiProviderMetadata("OPENAI_COMPATIBLE", "test-model", "daily-capture-v1")
+	private val metadata = DailyAiProviderMetadata("OPENAI_COMPATIBLE", "test-model", "daily-capture-v2")
 	private var userId: UserId = UserId(UUID.randomUUID())
 
 	@BeforeEach
@@ -158,13 +161,18 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 		assertEquals(userId, result.capture.userId)
 		assertEquals(date, result.date)
 		assertEquals(context.inboxEventId.value, result.capture.sourceEventId)
-		assertTrue(result.capture.payload.meals.single().mealTempId.startsWith("meal_"))
-		assertTrue(result.capture.payload.meals.single().items.single().itemTempId.startsWith("item_"))
+		assertEquals(DAILY_CAPTURE_SCHEMA_VERSION, result.capture.payload.schemaVersion)
+		val foodItem = result.capture.payload.entries.single().items.single()
+		assertEquals(DailyFoodItemSourceType.AI_ESTIMATE, foodItem.sourceType)
+		assertEquals("150", foodItem.calculatedNutrition.caloriesKcal?.toPlainString())
+		assertEquals(foodItem.itemId.toString(), result.capture.payload.meals.single().items.single().itemTempId)
 		assertEquals("A colazione 40 grammi di avena", event.rawText)
 		assertEquals(DailyInboxProcessingStatus.PROCESSED, event.processingStatus)
 		assertEquals(AiInterpretationStatus.SUCCESS, log.status)
 		assertEquals("test-model", log.model)
 		assertEquals(result.capture.captureId, log.captureId)
+		val nutritionResolutions = log.parsedOutput["nutritionResolutions"] as List<*>
+		assertEquals("NO_MATCH", (nutritionResolutions.single() as Map<*, *>)["outcome"])
 		assertEquals(
 			true,
 			jdbcTemplate.queryForObject(
@@ -283,7 +291,7 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 
 	@Test
 	fun `successful reprocess creates a new capture and links then rejects the old proposal`() {
-		val old = captureService.create(userId, date, fieldsInput())
+		val old = captureService.createFromUser(userId, date, fieldsPayload())
 		val context = prepareReprocess(old.captureId, "reprocess-a", "Peso 79 kg")
 
 		val result = assertIs<DailyAiResult.CaptureCreated>(
@@ -294,6 +302,10 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 
 		assertNotEquals(old.captureId, result.capture.captureId)
 		assertEquals(DailyCaptureStatus.OPEN, result.capture.status)
+		assertEquals(DAILY_CAPTURE_SCHEMA_VERSION, result.capture.payload.schemaVersion)
+		assertEquals(DailyCaptureType.DAILY_FIELDS, result.capture.payload.type)
+		assertEquals("WEIGHT", result.capture.payload.entries.single().type.name)
+		assertEquals(BigDecimal("79"), result.capture.payload.entries.single().value)
 		assertEquals(DailyCaptureStatus.REJECTED, persistedOld.status)
 		assertNotNull(persistedOld.rejectedAt)
 		assertEquals(old.captureId, result.replacedCaptureId)
@@ -304,7 +316,7 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 
 	@Test
 	fun `failure after new capture persistence rolls back both creation and replacement`() {
-		val old = captureService.create(userId, date, fieldsInput())
+		val old = captureService.createFromUser(userId, date, fieldsPayload())
 		val context = prepareReprocess(old.captureId, "reprocess-fail", "Peso 79 kg")
 		val failingTerminal = DailyAiTerminalService(
 			days,
@@ -312,6 +324,7 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 			inboxEvents,
 			FailAfterSavingLogRepository(logs),
 			captureService,
+			DailyAiCaptureProposalFactory(noCatalogMatches()),
 			transactions,
 			clock,
 		)
@@ -331,7 +344,7 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 
 	@Test
 	fun `two concurrent reprocess commits produce only one replacement`() {
-		val old = captureService.create(userId, date, fieldsInput())
+		val old = captureService.createFromUser(userId, date, fieldsPayload())
 		val first = prepareReprocess(old.captureId, "concurrent-a", "Peso 79 kg")
 		val second = prepareReprocess(old.captureId, "concurrent-b", "Peso 80 kg")
 		val start = CountDownLatch(1)
@@ -387,20 +400,29 @@ class DailyAiPersistenceIntegrationTest @Autowired constructor(
 		return assertIs<DailyAiPreparation.Execute>(preparation).context
 	}
 
-	private fun fieldsInput() = DailyCaptureInput(
-		type = DailyCaptureType.DAILY_FIELDS,
-		fields = DailyFieldsInput(bodyWeightKg = BigDecimal("78")),
-	)
+	private fun fieldsPayload() = dailyFieldsPayload(bodyWeightKg = BigDecimal("78"))
 
 	private fun foodProposal() = AiCaptureProposal(
 		type = "FOOD",
 		meals = listOf(
 			AiMealProposal(
 				mealName = "colazione",
-				items = listOf(AiFoodItemProposal("avena", BigDecimal("40"), "g")),
+				items = listOf(
+					AiFoodItemProposal(
+						foodName = "avena",
+						quantity = BigDecimal("40"),
+						unit = "g",
+						calories = BigDecimal("150"),
+						proteinG = BigDecimal("5"),
+						carbsG = BigDecimal("27"),
+						fatG = BigDecimal("3"),
+					),
+				),
 			),
 		),
 	)
+
+	private fun noCatalogMatches() = DailyAiUserFoodMatchPort { _, _ -> DailyAiUserFoodMatchResult.None }
 
 	private fun fieldsProposal(weight: String = "79") = AiCaptureProposal(
 		type = "DAILY_FIELDS",

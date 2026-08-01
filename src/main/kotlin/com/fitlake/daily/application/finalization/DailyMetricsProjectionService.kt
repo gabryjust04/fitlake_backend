@@ -62,7 +62,7 @@ class DailyMetricsProjectionService {
 			moodLevel = moodLevel,
 			focusLevel = focusLevel,
 			stressLevel = stressLevel,
-			totalCalories = foodItems.sumOptionalInt(MealItemDraft::calories),
+			totalCalories = foodItems.sumOptionalDecimal(MealItemDraft::calories),
 			proteinG = foodItems.sumOptionalDecimal(MealItemDraft::proteinG),
 			carbsG = foodItems.sumOptionalDecimal(MealItemDraft::carbsG),
 			fatG = foodItems.sumOptionalDecimal(MealItemDraft::fatG),
@@ -77,13 +77,10 @@ class DailyMetricsProjectionService {
 		)
 	}
 
-	private fun List<MealItemDraft>.sumOptionalInt(selector: (MealItemDraft) -> Int?): Int? {
-		val values = mapNotNull(selector)
-		return values.takeIf(List<Int>::isNotEmpty)?.sum()
-	}
-
 	private fun List<MealItemDraft>.sumOptionalDecimal(selector: (MealItemDraft) -> BigDecimal?): BigDecimal? {
-		val values = mapNotNull(selector)
-		return values.takeIf(List<BigDecimal>::isNotEmpty)?.fold(BigDecimal.ZERO, BigDecimal::add)
+		if (isEmpty()) return null
+		val values = map(selector)
+		if (values.any { it == null }) return null
+		return values.filterNotNull().fold(BigDecimal.ZERO, BigDecimal::add)
 	}
 }

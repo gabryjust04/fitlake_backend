@@ -32,8 +32,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import java.util.function.BiFunction
 
-internal const val DAILY_AI_PROMPT_VERSION = "daily-capture-v1"
-internal const val DAILY_AI_PROMPT_RESOURCE = "classpath:prompts/daily-capture-v1.txt"
+internal const val DAILY_AI_PROMPT_VERSION = "daily-capture-v2"
+internal const val DAILY_AI_PROMPT_RESOURCE = "classpath:prompts/daily-capture-v2.txt"
 internal const val DEFAULT_DAILY_AI_MAX_OUTPUT_TOKENS = 4096
 
 internal class SpringAiDailyAiInterpreter(
