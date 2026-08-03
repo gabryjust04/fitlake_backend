@@ -15,6 +15,7 @@ import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.daily.domain.common.DailyDay
 import com.fitlake.daily.domain.common.DailyDayStatus
 import com.fitlake.shared.application.TransactionExecutor
+import com.fitlake.shared.application.elapsedMilliseconds
 import com.fitlake.user.domain.UserId
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
@@ -32,24 +33,25 @@ class DailyManualCaptureService(
 	private val clock: Clock,
 ) {
 	fun create(userId: UserId, date: LocalDate, input: DailyCaptureContentInput): DailyCapture {
-		val startedAt = System.nanoTime()
+		val startedAtNanos = System.nanoTime()
 		val created = try {
 			transactionExecutor.required { createOnce(userId, date, input) }
 		} catch (exception: DailyConcurrentCreationException) {
 			transactionExecutor.required { createOnce(userId, date, input) }
 		}
-		logger.info(
-			"event=daily_capture_manual_created userId={} captureId={} day={} captureType={} " +
-				"entryCount={} foodItemCount={} version={} durationMs={}",
-			userId.value,
-			created.captureId.value,
-			date,
-			created.captureType,
-			created.payload.entries.size,
-			created.payload.entries.sumOf { it.items.size },
-			created.version,
-			elapsedMillis(startedAt),
-		)
+		logger.atInfo()
+			.addKeyValue("event", "daily_capture_created")
+			.addKeyValue("outcome", "success")
+			.addKeyValue("userRef", userId.value)
+			.addKeyValue("captureId", created.captureId.value)
+			.addKeyValue("captureType", created.captureType)
+			.addKeyValue("captureStatus", created.status)
+			.addKeyValue("sourceType", created.createdBy)
+			.addKeyValue("entryCount", created.payload.entries.size)
+			.addKeyValue("foodItemCount", created.payload.entries.sumOf { it.items.size })
+			.addKeyValue("newVersion", created.version)
+			.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+			.log("Daily capture created")
 		return created
 	}
 
@@ -62,11 +64,11 @@ class DailyManualCaptureService(
 	): DailyCapture {
 		if (expectedVersion < 0) throw DailyValidationException("Capture version must not be negative")
 		val normalizedRequestId = requestId?.trim()?.takeIf(String::isNotEmpty)
-		if (normalizedRequestId != null && normalizedRequestId.length > 100) {
-			throw DailyValidationException("Request ID must not exceed 100 characters")
+		if (normalizedRequestId != null && !REQUEST_ID_PATTERN.matches(normalizedRequestId)) {
+			throw DailyValidationException("Request ID contains unsupported characters or exceeds 100 characters")
 		}
-		val startedAt = System.nanoTime()
-		val updated = transactionExecutor.required {
+		val startedAtNanos = System.nanoTime()
+		val replacement = transactionExecutor.required {
 			val candidate = captureRepository.findByIdAndUserId(captureId, userId)
 				?: throw DailyNotFoundException.capture(captureId.value)
 			val day = dayRepository.findByIdForUpdate(candidate.dayId)
@@ -78,13 +80,16 @@ class DailyManualCaptureService(
 				?: throw DailyNotFoundException.capture(captureId.value)
 			if (current.dayId != day.dayId) throw DailyNotFoundException.capture(captureId.value)
 			if (current.version != expectedVersion) {
-				logger.warn(
-					"event=daily_capture_version_conflict userId={} captureId={} expectedVersion={} actualVersion={}",
-					userId.value,
-					captureId.value,
-					expectedVersion,
-					current.version,
-				)
+				logger.atWarn()
+					.addKeyValue("event", "daily_capture_version_conflict")
+					.addKeyValue("outcome", "rejected")
+					.addKeyValue("errorCode", "DAILY_CAPTURE_VERSION_CONFLICT")
+					.addKeyValue("userRef", userId.value)
+					.addKeyValue("captureId", captureId.value)
+					.addKeyValue("expectedVersion", expectedVersion)
+					.addKeyValue("actualVersion", current.version)
+					.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+					.log("Daily capture version conflict")
 				throw DailyConflictException("Capture version is stale")
 			}
 			ensureEditable(current)
@@ -111,22 +116,26 @@ class DailyManualCaptureService(
 					newVersion = persisted.version,
 					requestId = normalizedRequestId,
 					at = now,
+					status = persisted.status,
 				),
 			)
-			persisted
+			CaptureReplacement(current, persisted)
 		}
-		logger.info(
-			"event=daily_capture_content_replaced userId={} captureId={} captureType={} entryCount={} " +
-				"foodItemCount={} version={} durationMs={}",
-			userId.value,
-			captureId.value,
-			updated.captureType,
-			updated.payload.entries.size,
-			updated.payload.entries.sumOf { it.items.size },
-			updated.version,
-			elapsedMillis(startedAt),
-		)
-		return updated
+		logger.atInfo()
+			.addKeyValue("event", "daily_capture_content_replaced")
+			.addKeyValue("outcome", "success")
+			.addKeyValue("userRef", userId.value)
+			.addKeyValue("captureId", captureId.value)
+			.addKeyValue("captureType", replacement.after.captureType)
+			.addKeyValue("oldStatus", replacement.before.status)
+			.addKeyValue("newStatus", replacement.after.status)
+			.addKeyValue("oldVersion", replacement.before.version)
+			.addKeyValue("newVersion", replacement.after.version)
+			.addKeyValue("entryCount", replacement.after.payload.entries.size)
+			.addKeyValue("foodItemCount", replacement.after.payload.entries.sumOf { it.items.size })
+			.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+			.log("Daily capture content replaced")
+		return replacement.after
 	}
 
 	private fun createOnce(
@@ -136,7 +145,21 @@ class DailyManualCaptureService(
 	): DailyCapture {
 		val day = findOrCreateEditableDay(userId, date)
 		val payload = contentFactory.create(userId, input)
-		return captureRepository.save(DailyCapture.openFromUser(userId, day.dayId, payload, clock.instant()))
+		val now = clock.instant()
+		val persisted = captureRepository.save(DailyCapture.openFromUser(userId, day.dayId, payload, now))
+		auditRepository.save(
+			DailyCaptureAudit.create(
+				captureId = persisted.captureId,
+				userId = persisted.userId,
+				newPayload = persisted.payload,
+				actor = persisted.createdBy,
+				requestId = null,
+				at = persisted.createdAt,
+				newVersion = persisted.version,
+				newStatus = persisted.status,
+			),
+		)
+		return persisted
 	}
 
 	private fun findOrCreateEditableDay(userId: UserId, date: LocalDate): DailyDay {
@@ -154,9 +177,13 @@ class DailyManualCaptureService(
 		}
 	}
 
-	private fun elapsedMillis(startedAt: Long): Long = (System.nanoTime() - startedAt) / 1_000_000
+	private data class CaptureReplacement(
+		val before: DailyCapture,
+		val after: DailyCapture,
+	)
 
 	companion object {
+		private val REQUEST_ID_PATTERN = Regex("^[A-Za-z0-9._-]{1,100}$")
 		private val logger = LoggerFactory.getLogger(DailyManualCaptureService::class.java)
 	}
 }

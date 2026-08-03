@@ -2,6 +2,8 @@ package com.fitlake.daily.infrastructure.food
 
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchPort
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchResult
+import com.fitlake.daily.application.ai.DailyAiFoodMatchPolicy
+import com.fitlake.food.application.UserFoodSearchService
 import com.fitlake.food.domain.FoodUnit
 import com.fitlake.food.domain.NutrientValues
 import com.fitlake.food.domain.NutritionBasis
@@ -12,6 +14,7 @@ import com.fitlake.food.domain.UserFood
 import com.fitlake.food.domain.UserFoodDefinition
 import com.fitlake.food.infrastructure.persistence.mapper.UserFoodPersistenceMapper
 import com.fitlake.food.infrastructure.persistence.repository.JpaUserFoodRepositoryAdapter
+import com.fitlake.food.infrastructure.persistence.repository.PostgresUserFoodSearchAdapter
 import com.fitlake.shared.application.TransactionExecutor
 import com.fitlake.user.domain.UserAccount
 import com.fitlake.user.domain.UserId
@@ -40,12 +43,18 @@ import kotlin.test.assertIs
 	properties = [
 		"spring.jpa.hibernate.ddl-auto=validate",
 		"spring.flyway.enabled=true",
+		"fitlake.daily.ai.food-match.minimum-score=0.78",
+		"fitlake.daily.ai.food-match.minimum-margin=0.12",
 	],
 )
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
 @Testcontainers(disabledWithoutDocker = true)
 @Import(
 	PostgresDailyAiUserFoodMatchAdapter::class,
+	CatalogDailyUserFoodLookupAdapter::class,
+	DailyAiFoodMatchPolicy::class,
+	UserFoodSearchService::class,
+	PostgresUserFoodSearchAdapter::class,
 	UserFoodPersistenceMapper::class,
 	JpaUserFoodRepositoryAdapter::class,
 	UserPersistenceMapper::class,
@@ -106,12 +115,12 @@ class PostgresDailyAiUserFoodMatchAdapterTest @Autowired constructor(
 	}
 
 	@Test
-	fun `prefix and fuzzy similarities do not produce an automatic match`() {
+	fun `weak prefix is ambiguous while a strong typo can be accepted`() {
 		createFood(userA, "Greek yogurt", aliases = listOf("Breakfast yogurt"))
 
-		assertIs<DailyAiUserFoodMatchResult.None>(matcher.match(userA, "Greek"))
-		assertIs<DailyAiUserFoodMatchResult.None>(matcher.match(userA, "Greek yogurth"))
-		assertIs<DailyAiUserFoodMatchResult.None>(matcher.match(userA, "Breakfast"))
+		assertIs<DailyAiUserFoodMatchResult.Ambiguous>(matcher.match(userA, "Greek"))
+		assertIs<DailyAiUserFoodMatchResult.Unique>(matcher.match(userA, "Greek yogurth"))
+		assertIs<DailyAiUserFoodMatchResult.Ambiguous>(matcher.match(userA, "Breakfast"))
 	}
 
 	@Test

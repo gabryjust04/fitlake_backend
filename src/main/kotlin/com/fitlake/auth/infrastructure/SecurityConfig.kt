@@ -1,6 +1,7 @@
 package com.fitlake.auth.infrastructure
 
 import com.fitlake.auth.infrastructure.firebase.FirebaseAuthenticationFilter
+import org.springframework.boot.web.servlet.FilterRegistrationBean
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.security.config.Customizer
@@ -11,6 +12,12 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 
 @Configuration(proxyBeanMethods = false)
 class SecurityConfig {
+	@Bean
+	fun firebaseAuthenticationFilterServletRegistration(
+		firebaseAuthenticationFilter: FirebaseAuthenticationFilter,
+	) = FilterRegistrationBean(firebaseAuthenticationFilter).apply {
+		isEnabled = false
+	}
 
 	@Bean
 	fun securityFilterChain(

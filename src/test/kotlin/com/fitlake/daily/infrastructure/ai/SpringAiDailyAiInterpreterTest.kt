@@ -1,439 +1,328 @@
 package com.fitlake.daily.infrastructure.ai
 
-import com.fitlake.daily.application.ai.AiCaptureProposal
-import com.fitlake.daily.application.ai.AiFoodItemProposal
-import com.fitlake.daily.application.ai.AiMealProposal
+import ch.qos.logback.classic.Level
+import com.openai.core.http.Headers
+import com.openai.errors.UnexpectedStatusCodeException
 import com.fitlake.daily.application.ai.DailyAiInvalidOutputException
-import com.fitlake.daily.application.ai.DailyAiPersistenceException
+import com.fitlake.daily.application.ai.DailyAiProviderAuthenticationException
 import com.fitlake.daily.application.ai.DailyAiProviderMetadata
+import com.fitlake.daily.application.ai.DailyAiProviderQuotaException
 import com.fitlake.daily.application.ai.DailyAiProviderUnavailableException
-import com.fitlake.daily.application.ai.DailyAiRequestContext
-import com.fitlake.daily.application.ai.DailyAiResult
-import com.fitlake.daily.application.ai.DailyAiTerminalService
+import com.fitlake.daily.application.ai.DailyAiRateLimitException
 import com.fitlake.daily.application.ai.DailyAiTimeoutException
-import com.fitlake.daily.application.ai.toAiCaptureResult
-import com.fitlake.daily.domain.capture.DailyCapture
-import com.fitlake.daily.domain.capture.DailyCaptureEntry
-import com.fitlake.daily.domain.capture.DailyCaptureEntryType
-import com.fitlake.daily.domain.capture.DailyCapturePayload
-import com.fitlake.daily.domain.common.DailyDayId
-import com.fitlake.daily.domain.inbox.DailyInboxEventId
-import com.fitlake.user.domain.UserId
+import com.fitlake.daily.application.ai.DailyMessageInterpretationOutcome
+import com.fitlake.daily.application.ai.InterpretDailyMessageRequest
+import com.fitlake.daily.application.ai.InterpretedDailyMessage
+import com.fitlake.support.LogEventCapture
+import com.fitlake.support.renderedLogContent
+import com.fitlake.support.structuredFields
 import org.junit.jupiter.api.Test
-import org.mockito.Mockito.doReturn
-import org.mockito.Mockito.doThrow
-import org.mockito.Mockito.mock
-import org.mockito.Mockito.verify
-import org.mockito.Mockito.verifyNoInteractions
-import org.junit.jupiter.api.extension.ExtendWith
 import org.springframework.ai.chat.messages.AssistantMessage
+import org.springframework.ai.chat.metadata.ChatResponseMetadata
+import org.springframework.ai.chat.metadata.DefaultUsage
 import org.springframework.ai.chat.model.ChatModel
 import org.springframework.ai.chat.model.ChatResponse
 import org.springframework.ai.chat.model.Generation
-import org.springframework.ai.chat.model.ToolContext
 import org.springframework.ai.chat.prompt.Prompt
-import org.springframework.ai.model.tool.ToolCallingChatOptions
-import org.springframework.ai.model.tool.ToolCallingManager
-import org.springframework.ai.model.tool.ToolExecutionResult
+import org.springframework.ai.openai.OpenAiChatModel
 import org.springframework.ai.openai.OpenAiChatOptions
-import org.springframework.ai.tool.definition.ToolDefinition
 import org.springframework.ai.util.JsonHelper
-import org.springframework.boot.test.system.CapturedOutput
-import org.springframework.boot.test.system.OutputCaptureExtension
 import org.springframework.core.io.DefaultResourceLoader
-import java.math.BigDecimal
 import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
-import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
-import java.util.UUID
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
-@ExtendWith(OutputCaptureExtension::class)
 class SpringAiDailyAiInterpreterTest {
-	private val terminalService = mock(DailyAiTerminalService::class.java)
-	private val context = DailyAiRequestContext(
-		inboxEventId = DailyInboxEventId(UUID.fromString("10000000-0000-0000-0000-000000000001")),
-		userId = UserId(UUID.fromString("20000000-0000-0000-0000-000000000002")),
-		date = LocalDate.parse("2026-07-30"),
+	private val request = InterpretDailyMessageRequest(
+		targetDate = LocalDate.parse("2026-07-30"),
 		timezone = ZoneId.of("Europe/Rome"),
-		replacesCaptureId = null,
-		metadata = METADATA,
-		startedAt = Instant.parse("2026-07-30T08:00:00Z"),
-		processingAttemptId = UUID.fromString("40000000-0000-0000-0000-000000000004"),
+		text = "A colazione ho mangiato 40 g avena",
 	)
 
 	@Test
-	fun `one valid createCapture tool is executed and returns its terminal result`() {
-		val expected = captureCreatedResult()
-		val expectedProposal = AiCaptureProposal(
-			type = "NOTE",
-			note = "Oggi mi sento bene",
-			confidence = BigDecimal("0.95"),
-		)
-		doReturn(expected).`when`(terminalService).createCapture(context, expectedProposal)
-		val chatModel = ScriptedChatModel {
-			toolResponse(toolCall("createCapture", VALID_CREATE_CAPTURE_ARGUMENTS))
-		}
-		val interpreter = interpreter(chatModel)
-
-		val actual = interpreter.interpret(context, "Oggi mi sento bene")
-
-		assertSame(expected, actual)
-		verify(terminalService).createCapture(context, expectedProposal)
-		assertEquals(1, chatModel.callCount)
-	}
-
-	@Test
-	fun `complete food nutrition estimates bind as decimals and reach the terminal service`() {
-		val expected = captureCreatedResult()
-		val expectedProposal = AiCaptureProposal(
-			type = "FOOD",
-			meals = listOf(
-				AiMealProposal(
-					mealName = "pranzo",
-					items = listOf(
-						AiFoodItemProposal(
-							foodName = "pollo",
-							quantity = BigDecimal("100"),
-							unit = "g",
-							calories = BigDecimal("165.25"),
-							proteinG = BigDecimal("31.125"),
-							carbsG = BigDecimal.ZERO,
-							fatG = BigDecimal("3.6"),
-						),
-					),
-				),
-			),
-			confidence = BigDecimal("0.88"),
-		)
-		doReturn(expected).`when`(terminalService).createCapture(context, expectedProposal)
-		val interpreter = interpreter(
-			ScriptedChatModel {
-				toolResponse(toolCall("createCapture", VALID_FOOD_CREATE_CAPTURE_ARGUMENTS))
-			},
-		)
-
-		val actual = interpreter.interpret(context, "100 grammi di pollo")
-
-		assertSame(expected, actual)
-		verify(terminalService).createCapture(context, expectedProposal)
-	}
-
-	@Test
-	fun `terminal result survives a framework failure raised after the callback`() {
-		val expected = captureCreatedResult()
-		val expectedProposal = createCaptureProposal()
-		doReturn(expected).`when`(terminalService).createCapture(context, expectedProposal)
-		val response = toolResponse(toolCall("createCapture", VALID_CREATE_CAPTURE_ARGUMENTS))
-		val toolCallingManager = ScriptedToolCallingManager { prompt, chatResponse ->
-			executeTerminalCallback(prompt, chatResponse)
-			throw IllegalStateException("post-callback conversion failed")
-		}
-		val interpreter = interpreter(ScriptedChatModel { response }, toolCallingManager)
-
-		val actual = interpreter.interpret(context, "Oggi mi sento bene")
-
-		assertSame(expected, actual)
-		verify(terminalService).createCapture(context, expectedProposal)
-	}
-
-	@Test
-	fun `terminal result wins over an inconsistent non-direct execution result`() {
-		val expected = captureCreatedResult()
-		val expectedProposal = createCaptureProposal()
-		doReturn(expected).`when`(terminalService).createCapture(context, expectedProposal)
-		val response = toolResponse(toolCall("createCapture", VALID_CREATE_CAPTURE_ARGUMENTS))
-		val toolCallingManager = ScriptedToolCallingManager { prompt, chatResponse ->
-			executeTerminalCallback(prompt, chatResponse)
-			ToolExecutionResult.builder()
-				.conversationHistory(prompt.instructions)
-				.returnDirect(false)
-				.build()
-		}
-		val interpreter = interpreter(ScriptedChatModel { response }, toolCallingManager)
-
-		val actual = interpreter.interpret(context, "Oggi mi sento bene")
-
-		assertSame(expected, actual)
-		verify(terminalService).createCapture(context, expectedProposal)
-	}
-
-	@Test
-	fun `terminal failure is not masked by a later framework failure`() {
-		val terminalFailure = DailyAiPersistenceException()
-		val expectedProposal = createCaptureProposal()
-		doThrow(terminalFailure).`when`(terminalService).createCapture(context, expectedProposal)
-		val response = toolResponse(toolCall("createCapture", VALID_CREATE_CAPTURE_ARGUMENTS))
-		val toolCallingManager = ScriptedToolCallingManager { prompt, chatResponse ->
-			try {
-				executeTerminalCallback(prompt, chatResponse)
-			} catch (_: RuntimeException) {
-				// Simulate framework processing that catches the callback failure before failing itself.
-			}
-			throw IllegalStateException("framework failure")
-		}
-		val interpreter = interpreter(ScriptedChatModel { response }, toolCallingManager)
-
-		val actual = assertFailsWith<DailyAiPersistenceException> {
-			interpreter.interpret(context, "Oggi mi sento bene")
-		}
-
-		assertSame(terminalFailure, actual)
-	}
-
-	@Test
-	fun `zero tool calls are rejected without terminal side effects`() {
-		val interpreter = interpreter(ScriptedChatModel { textResponse("") })
-
-		assertFailsWith<DailyAiInvalidOutputException> {
-			interpreter.interpret(context, "testo")
-		}
-
-		verifyNoInteractions(terminalService)
-	}
-
-	@Test
-	fun `multiple tool calls are rejected before any terminal side effect`() {
-		val interpreter = interpreter(
-			ScriptedChatModel {
-				toolResponse(
-					toolCall("createCapture", VALID_CREATE_CAPTURE_ARGUMENTS, "call-create"),
-					toolCall("noOp", """{"reason":"Nessun dato"}""", "call-noop"),
-				)
-			},
-		)
-
-		assertFailsWith<DailyAiInvalidOutputException> {
-			interpreter.interpret(context, "testo")
-		}
-
-		verifyNoInteractions(terminalService)
-	}
-
-	@Test
-	fun `multiple generations are rejected before any terminal side effect`() {
-		val interpreter = interpreter(
-			ScriptedChatModel {
-				ChatResponse(
-					listOf(
-						Generation(toolMessage(toolCall("createCapture", VALID_CREATE_CAPTURE_ARGUMENTS))),
-						Generation(AssistantMessage("")),
-					),
-				)
-			},
-		)
-
-		assertFailsWith<DailyAiInvalidOutputException> {
-			interpreter.interpret(context, "testo")
-		}
-
-		verifyNoInteractions(terminalService)
-	}
-
-	@Test
-	fun `free text alongside one terminal tool is rejected before any terminal side effect`() {
-		val interpreter = interpreter(
-			ScriptedChatModel {
-				ChatResponse(
-					listOf(
-						Generation(
-							toolMessage(
-								toolCall("createCapture", VALID_CREATE_CAPTURE_ARGUMENTS),
-								text = "Ho preparato la proposta.",
-							),
-						),
-					),
-				)
-			},
-		)
-
-		assertFailsWith<DailyAiInvalidOutputException> {
-			interpreter.interpret(context, "testo")
-		}
-
-		verifyNoInteractions(terminalService)
-	}
-
-	@Test
-	fun `unknown tool is rejected before any terminal side effect`() {
-		val interpreter = interpreter(
-			ScriptedChatModel { toolResponse(toolCall("deleteEverything", "{}")) },
-		)
-
-		assertFailsWith<DailyAiInvalidOutputException> {
-			interpreter.interpret(context, "testo")
-		}
-
-		verifyNoInteractions(terminalService)
-	}
-
-	@Test
-	fun `invalid tool JSON is rejected without terminal side effects`() {
-		val interpreter = interpreter(
-			ScriptedChatModel { toolResponse(toolCall("createCapture", "not-json")) },
-		)
-
-		assertFailsWith<DailyAiInvalidOutputException> {
-			interpreter.interpret(context, "testo")
-		}
-
-		verifyNoInteractions(terminalService)
-	}
-
-	@Test
-	fun `timeout cause is mapped without executing a tool`() {
-		val interpreter = interpreter(
-			ScriptedChatModel { throw IllegalStateException(SocketTimeoutException("timed out")) },
-		)
-
-		assertFailsWith<DailyAiTimeoutException> {
-			interpreter.interpret(context, "testo")
-		}
-
-		verifyNoInteractions(terminalService)
-	}
-
-	@Test
-	fun `provider failure is mapped and safely logged without executing a tool`(output: CapturedOutput) {
-		val providerFailure = IllegalStateException(
-			"HTTP 400 invalid tools; Authorization: Bearer exposed-token; key=sk-or-v1-secretsecretsecret",
-		)
-		val interpreter = interpreter(ScriptedChatModel { throw providerFailure })
-
-		val exception = assertFailsWith<DailyAiProviderUnavailableException> {
-			interpreter.interpret(context, "testo")
-		}
-
-		assertSame(providerFailure, exception.cause)
-		assertTrue(output.all.contains("Daily AI provider call failed"))
-		assertTrue(output.all.contains("HTTP 400 invalid tools"))
-		assertFalse(output.all.contains("exposed-token"))
-		assertFalse(output.all.contains("sk-or-v1-secretsecretsecret"))
-		verifyNoInteractions(terminalService)
-	}
-
-	@Test
-	fun `prompt exposes safe schemas and an exact backend context envelope`() {
-		val originalText = "Ho dormito 7 ore e il testo contiene \"virgolette\""
+	fun `structured JSON is parsed without tools and reports provider usage`() {
 		lateinit var observedPrompt: Prompt
 		val chatModel = ScriptedChatModel { prompt ->
 			observedPrompt = prompt
-			textResponse("ignored")
+			textResponse(VALID_COMPLETE_OUTPUT, promptTokens = 17, completionTokens = 11)
 		}
-		val interpreter = interpreter(chatModel)
 
-		assertFailsWith<DailyAiInvalidOutputException> {
-			interpreter.interpret(context, originalText)
-		}
+		val result = interpreter(chatModel).interpret(request)
+
+		assertEquals(DailyMessageInterpretationOutcome.COMPLETE, result.interpretation.outcome)
+		assertEquals("40 g avena", result.interpretation.meals.single().items.single().originalFragment)
+		assertEquals(0, result.retryCount)
+		assertEquals(17L, result.inputTokens)
+		assertEquals(11L, result.outputTokens)
+		assertEquals(1, chatModel.callCount)
 
 		val envelope = JsonHelper().fromJsonToMap(requireNotNull(observedPrompt.userMessage.text))
 		assertEquals("2026-07-30", envelope["targetDate"])
 		assertEquals("Europe/Rome", envelope["timezone"])
-		assertEquals(originalText, envelope["text"])
+		assertEquals(request.text, envelope["text"])
 		assertEquals(setOf("targetDate", "timezone", "text"), envelope.keys)
 
-		val options = observedPrompt.options as ToolCallingChatOptions
-		val openAiOptions = observedPrompt.options as OpenAiChatOptions
-		val toolCallbacks = requireNotNull(options.toolCallbacks)
-		assertEquals(3, toolCallbacks.size)
-		assertEquals(4096, openAiOptions.maxTokens)
-		val schemas = toolCallbacks.joinToString("\n") { it.toolDefinition.inputSchema() }
+		val options = observedPrompt.options as OpenAiChatOptions
+		assertTrue(options.toolCallbacks.isNullOrEmpty())
+		assertNull(options.toolChoice)
+		assertEquals(4096, options.maxTokens)
+		val responseFormat = requireNotNull(options.responseFormat)
+		assertEquals(OpenAiChatModel.ResponseFormat.Type.JSON_SCHEMA, responseFormat.type)
+		val schema = requireNotNull(responseFormat.jsonSchema)
+		assertContains(schema, "originalFragment")
+		assertContains(schema, "estimatedQuantity")
+		assertContains(schema, "nutritionEstimate")
 		FORBIDDEN_MODEL_CONTROLLED_FIELDS.forEach { forbidden ->
-			assertFalse(schemas.contains(forbidden, ignoreCase = true), "$forbidden leaked into a tool schema")
+			assertFalse(schema.contains("\"$forbidden\"", ignoreCase = true), "$forbidden leaked into the schema")
 		}
-		assertTrue(schemas.contains("foodName"))
-		assertTrue(schemas.contains("calories"))
-		assertTrue(schemas.contains("proteinG"))
-		assertTrue(schemas.contains("carbsG"))
-		assertTrue(schemas.contains("fatG"))
-		assertTrue(schemas.contains("sleepHours"))
-		val createCaptureSchema = JsonHelper().fromJsonToMap(
-			toolCallbacks.single { it.toolDefinition.name() == "createCapture" }.toolDefinition.inputSchema(),
-		)
-		val foodItemSchema = requireNotNull(findSchemaWithProperty(createCaptureSchema, "foodName"))
-		val requiredFoodItemFields = (foodItemSchema["required"] as? List<*>)
-			.orEmpty()
-			.filterIsInstance<String>()
-			.toSet()
-		assertTrue(
-			requiredFoodItemFields.containsAll(setOf("calories", "proteinG", "carbsG", "fatG")),
-			"Complete nutrition estimates must be required by the createCapture tool schema",
-		)
 	}
 
 	@Test
-	fun `v2 prompt requires a complete non-negative nutrition fallback for every food item`() {
-		assertEquals("daily-capture-v2", DAILY_AI_PROMPT_VERSION)
-		assertEquals("classpath:prompts/daily-capture-v2.txt", DAILY_AI_PROMPT_RESOURCE)
+	fun `invalid exact fragment is corrected once and usage is accumulated`() {
+		val prompts = mutableListOf<Prompt>()
+		val chatModel = QueuedChatModel(
+			listOf(
+				textResponse(INVALID_FRAGMENT_OUTPUT, promptTokens = 10, completionTokens = 4),
+				textResponse(VALID_COMPLETE_OUTPUT, promptTokens = 12, completionTokens = 6),
+			),
+			prompts,
+		)
+
+		lateinit var result: InterpretedDailyMessage
+		val logEvents = LogEventCapture(SpringAiDailyAiInterpreter::class.java, Level.DEBUG).use { logs ->
+			result = interpreter(chatModel, maxCorrectionRetries = 1).interpret(request)
+			logs.events
+		}
+
+		assertEquals(1, result.retryCount)
+		assertEquals(22L, result.inputTokens)
+		assertEquals(10L, result.outputTokens)
+		assertEquals(2, chatModel.callCount)
+		assertFalse(requireNotNull(prompts.first().systemMessage.text).contains("previous response failed", ignoreCase = true))
+		assertTrue(requireNotNull(prompts.last().systemMessage.text).contains("previous response failed", ignoreCase = true))
+		assertFalse(requireNotNull(prompts.last().systemMessage.text).contains("41 g avena"))
+
+		val retryFields = logEvents
+			.single { it.structuredFields()["event"] == "daily_ai_schema_retry" }
+			.structuredFields()
+		assertEquals("retry", retryFields["outcome"])
+		assertEquals("AI_OUTPUT_SCHEMA_INVALID", retryFields["errorCode"])
+		assertEquals(METADATA.provider, retryFields["provider"])
+		assertEquals("test-model", retryFields["model"])
+		assertEquals(DAILY_AI_PROMPT_VERSION, retryFields["promptVersion"])
+		assertEquals(1, retryFields["attempt"])
+		assertTrue((retryFields["reasonType"] as? String).orEmpty().isNotBlank())
+		assertFalse(retryFields.containsKey("rawResponse"))
+		val renderedLogs = logEvents.renderedLogContent()
+		assertFalse(renderedLogs.contains(request.text))
+		assertFalse(renderedLogs.contains("41 g avena"))
+		assertFalse(renderedLogs.contains("nutritionEstimate"))
+	}
+
+	@Test
+	fun `prompt enforced schema works when the OpenRouter model does not support native response format`() {
+		val prompts = mutableListOf<Prompt>()
+		val chatModel = QueuedChatModel(listOf(textResponse(VALID_COMPLETE_OUTPUT)), prompts)
+
+		interpreter(chatModel, nativeStructuredOutputEnabled = false).interpret(request)
+
+		val prompt = prompts.single()
+		val options = prompt.options as OpenAiChatOptions
+		assertNull(options.responseFormat)
+		assertContains(requireNotNull(prompt.systemMessage.text), "originalFragment")
+		assertTrue(options.toolCallbacks.isNullOrEmpty())
+	}
+
+	@Test
+	fun `bounded correction retry ends in invalid output without accepting paraphrased fragments`() {
+		val chatModel = QueuedChatModel(
+			listOf(textResponse(INVALID_FRAGMENT_OUTPUT), textResponse(INVALID_FRAGMENT_OUTPUT)),
+		)
+
+		assertFailsWith<DailyAiInvalidOutputException> {
+			interpreter(chatModel, maxCorrectionRetries = 1).interpret(request)
+		}
+
+		assertEquals(2, chatModel.callCount)
+	}
+
+	@Test
+	fun `missing provider usage remains unknown instead of becoming zero`() {
+		val result = interpreter(ScriptedChatModel { textResponse(VALID_COMPLETE_OUTPUT) }).interpret(request)
+
+		assertNull(result.inputTokens)
+		assertNull(result.outputTokens)
+	}
+
+	@Test
+	fun `outcome invariants are validated before returning the interpretation`() {
+		val invalidNoRelevant = VALID_COMPLETE_OUTPUT.replace("\"COMPLETE\"", "\"NO_RELEVANT_DATA\"")
+		val chatModel = ScriptedChatModel { textResponse(invalidNoRelevant) }
+
+		assertFailsWith<DailyAiInvalidOutputException> {
+			interpreter(chatModel, maxCorrectionRetries = 0).interpret(request)
+		}
+	}
+
+	@Test
+	fun `unknown model controlled fields are rejected instead of silently ignored`() {
+		val outputWithBackendId = VALID_COMPLETE_OUTPUT.replace(
+			"\"outcome\": \"COMPLETE\"",
+			"\"captureId\": \"model-owned-id\", \"outcome\": \"COMPLETE\"",
+		)
+		val chatModel = ScriptedChatModel { textResponse(outputWithBackendId) }
+
+		assertFailsWith<DailyAiInvalidOutputException> {
+			interpreter(chatModel, maxCorrectionRetries = 0).interpret(request)
+		}
+
+		assertEquals(1, chatModel.callCount)
+	}
+
+	@Test
+	fun `estimated quantity must be directly scalable from its nutrition basis`() {
+		val incompatibleEstimate = VALID_COMPLETE_OUTPUT.replace(
+			"\"estimatedQuantity\": {\"amount\": 40, \"unit\": \"g\"}",
+			"\"estimatedQuantity\": {\"amount\": 1, \"unit\": \"unit\"}",
+		)
+		val chatModel = ScriptedChatModel { textResponse(incompatibleEstimate) }
+
+		assertFailsWith<DailyAiInvalidOutputException> {
+			interpreter(chatModel, maxCorrectionRetries = 0).interpret(request)
+		}
+
+		assertEquals(1, chatModel.callCount)
+	}
+
+	@Test
+	fun `tool calls are rejected and never registered in provider options`() {
+		val prompts = mutableListOf<Prompt>()
+		val toolResponse = ChatResponse(
+			listOf(
+				Generation(
+					AssistantMessage.builder()
+						.content("")
+						.toolCalls(
+							listOf(AssistantMessage.ToolCall("call-1", "function", "createCapture", "{}")),
+						)
+						.build(),
+				),
+			),
+		)
+		val chatModel = QueuedChatModel(listOf(toolResponse, toolResponse), prompts)
+
+		assertFailsWith<DailyAiInvalidOutputException> {
+			interpreter(chatModel, maxCorrectionRetries = 1).interpret(request)
+		}
+
+		assertEquals(2, chatModel.callCount)
+		prompts.forEach { prompt ->
+			val options = prompt.options as OpenAiChatOptions
+			assertTrue(options.toolCallbacks.isNullOrEmpty())
+			assertNull(options.toolChoice)
+		}
+	}
+
+	@Test
+	fun `timeout is mapped without retrying structured output`() {
+		val providerFailure = IllegalStateException(SocketTimeoutException("timed out with secret text"))
+		val chatModel = ScriptedChatModel { throw providerFailure }
+
+		val exception = assertFailsWith<DailyAiTimeoutException> {
+			interpreter(chatModel).interpret(request)
+		}
+
+		assertSame(providerFailure, exception.cause)
+		assertEquals(1, chatModel.callCount)
+	}
+
+	@Test
+	fun `provider failure is translated without duplicate adapter logging`() {
+		val providerFailure = IllegalStateException(
+			"HTTP 400 Authorization: Bearer exposed-token; key=provider-secret-token; ${request.text}",
+		)
+		val chatModel = ScriptedChatModel { throw providerFailure }
+
+		lateinit var exception: DailyAiProviderUnavailableException
+		val logEvents = LogEventCapture(SpringAiDailyAiInterpreter::class.java, Level.DEBUG).use { logs ->
+			exception = assertFailsWith<DailyAiProviderUnavailableException> {
+				interpreter(chatModel).interpret(request)
+			}
+			logs.events
+		}
+
+		assertSame(providerFailure, exception.cause)
+		assertTrue(logEvents.isEmpty(), "The application boundary owns the single provider failure event")
+	}
+
+	@Test
+	fun `provider HTTP statuses are normalized without parsing raw response messages`() {
+		val expectedTypes = mapOf(
+			401 to DailyAiProviderAuthenticationException::class,
+			402 to DailyAiProviderQuotaException::class,
+			408 to DailyAiTimeoutException::class,
+			429 to DailyAiRateLimitException::class,
+			503 to DailyAiProviderUnavailableException::class,
+		)
+
+		expectedTypes.forEach { (status, expectedType) ->
+			val sdkFailure = UnexpectedStatusCodeException.builder()
+				.statusCode(status)
+				.headers(Headers.builder().build())
+				.build()
+			val wrappedFailure = IllegalStateException("private provider response body", sdkFailure)
+			val thrown = assertFails {
+				interpreter(ScriptedChatModel { throw wrappedFailure }).interpret(request)
+			}
+
+			assertEquals(expectedType, thrown::class, "Unexpected mapping for HTTP $status")
+			assertSame(wrappedFailure, thrown.cause)
+		}
+	}
+
+	@Test
+	fun `v3 prompt defines pure structured outcomes quantities nutrition and exact fragments`() {
+		assertEquals("daily-capture-v3", DAILY_AI_PROMPT_VERSION)
+		assertEquals("classpath:prompts/daily-capture-v3.txt", DAILY_AI_PROMPT_RESOURCE)
 		val prompt = DefaultResourceLoader()
 			.getResource(DAILY_AI_PROMPT_RESOURCE)
 			.getContentAsString(StandardCharsets.UTF_8)
 
-		assertTrue(prompt.contains("Every food item must include calories, proteinG, carbsG, and fatG"))
-		assertTrue(prompt.contains("All four values are required and must be numeric and non-negative"))
-		assertTrue(prompt.contains("complete consumed quantity"))
-		assertTrue(prompt.contains("backend fallback estimates"))
-		assertFalse(prompt.contains("Do not estimate calories or macronutrients"))
-		assertFalse(prompt.contains("Leave unknown nutrition values absent"))
+		assertContains(prompt, "Never call tools")
+		assertContains(prompt, "COMPLETE")
+		assertContains(prompt, "PARTIAL")
+		assertContains(prompt, "UNRESOLVED")
+		assertContains(prompt, "NO_RELEVANT_DATA")
+		assertContains(prompt, "originalFragment")
+		assertContains(prompt, "statedQuantity")
+		assertContains(prompt, "estimatedQuantity")
+		assertContains(prompt, "nutritionEstimate.basis")
+		assertContains(prompt, "backend performs final scaling")
+		assertFalse(prompt.contains("askClarification"))
+		assertFalse(prompt.contains("createCapture"))
 	}
 
 	private fun interpreter(
 		chatModel: ChatModel,
-		toolCallingManager: ToolCallingManager = ToolCallingManager.builder().build(),
+		maxCorrectionRetries: Int = DEFAULT_DAILY_AI_MAX_CORRECTION_RETRIES,
+		nativeStructuredOutputEnabled: Boolean = true,
 	): SpringAiDailyAiInterpreter = SpringAiDailyAiInterpreter(
 		chatModel = chatModel,
-		toolCallingManager = toolCallingManager,
-		terminalService = terminalService,
-		systemPrompt = "Choose exactly one terminal Daily tool.",
+		systemPrompt = "Return a pure structured Daily interpretation.",
 		metadata = METADATA,
+		maxCorrectionRetries = maxCorrectionRetries,
+		nativeStructuredOutputEnabled = nativeStructuredOutputEnabled,
 	)
-
-	private fun captureCreatedResult(): DailyAiResult.CaptureCreated {
-		val at = Instant.parse("2026-07-30T08:01:00Z")
-		val capture = DailyCapture.openFromAi(
-			userId = context.userId,
-			dayId = DailyDayId(UUID.fromString("30000000-0000-0000-0000-000000000003")),
-			sourceEventId = context.inboxEventId.value,
-			payload = DailyCapturePayload.fromEntries(
-				listOf(DailyCaptureEntry(UUID.randomUUID(), DailyCaptureEntryType.NOTE, text = "Oggi mi sento bene")),
-			),
-			confidence = BigDecimal("0.95"),
-			at = at,
-		)
-		return DailyAiResult.CaptureCreated(context.date, capture.toAiCaptureResult(), null)
-	}
-
-	private fun createCaptureProposal() = AiCaptureProposal(
-		type = "NOTE",
-		note = "Oggi mi sento bene",
-		confidence = BigDecimal("0.95"),
-	)
-
-	private fun executeTerminalCallback(prompt: Prompt, response: ChatResponse) {
-		val toolCall = response.results.single().output.toolCalls.single()
-		val callbacks = requireNotNull((prompt.options as ToolCallingChatOptions).toolCallbacks)
-		val callback = callbacks.single { it.toolDefinition.name() == toolCall.name() }
-		callback.call(toolCall.arguments(), ToolContext(emptyMap()))
-	}
-
-	private fun findSchemaWithProperty(value: Any?, property: String): Map<*, *>? = when (value) {
-		is Map<*, *> -> {
-			val properties = value["properties"] as? Map<*, *>
-			if (properties?.containsKey(property) == true) {
-				value
-			} else {
-				value.values.firstNotNullOfOrNull { nested -> findSchemaWithProperty(nested, property) }
-			}
-		}
-		is Iterable<*> -> value.firstNotNullOfOrNull { nested -> findSchemaWithProperty(nested, property) }
-		else -> null
-	}
 
 	private class ScriptedChatModel(
 		private val response: (Prompt) -> ChatResponse,
@@ -447,13 +336,19 @@ class SpringAiDailyAiInterpreterTest {
 		}
 	}
 
-	private class ScriptedToolCallingManager(
-		private val execution: (Prompt, ChatResponse) -> ToolExecutionResult,
-	) : ToolCallingManager {
-		override fun resolveToolDefinitions(options: ToolCallingChatOptions): List<ToolDefinition> = emptyList()
+	private class QueuedChatModel(
+		responses: List<ChatResponse>,
+		private val observedPrompts: MutableList<Prompt> = mutableListOf(),
+	) : ChatModel {
+		private val responses = ArrayDeque(responses)
+		var callCount: Int = 0
+			private set
 
-		override fun executeToolCalls(prompt: Prompt, chatResponse: ChatResponse): ToolExecutionResult =
-			execution(prompt, chatResponse)
+		override fun call(prompt: Prompt): ChatResponse {
+			callCount += 1
+			observedPrompts += prompt
+			return responses.removeFirst()
+		}
 	}
 
 	private companion object {
@@ -462,45 +357,43 @@ class SpringAiDailyAiInterpreterTest {
 			model = "test-model",
 			promptVersion = DAILY_AI_PROMPT_VERSION,
 		)
-		val VALID_CREATE_CAPTURE_ARGUMENTS = """
+		val VALID_COMPLETE_OUTPUT = """
 			{
-			  "type": "NOTE",
-			  "meals": [],
-			  "fields": {},
-			  "note": "Oggi mi sento bene",
-			  "confidence": 0.95
-			}
-		""".trimIndent()
-		val VALID_FOOD_CREATE_CAPTURE_ARGUMENTS = """
-			{
-			  "type": "FOOD",
+			  "outcome": "COMPLETE",
 			  "meals": [
 			    {
-			      "mealName": "pranzo",
+			      "mealName": "colazione",
 			      "items": [
 			        {
-			          "foodName": "pollo",
-			          "quantity": 100,
-			          "unit": "g",
-			          "calories": 165.25,
-			          "proteinG": 31.125,
-			          "carbsG": 0,
-			          "fatG": 3.6
+			          "originalFragment": "40 g avena",
+			          "searchText": "avena",
+			          "statedQuantity": {"amount": 40, "unit": "g"},
+			          "estimatedQuantity": {"amount": 40, "unit": "g"},
+			          "nutritionEstimate": {
+			            "basis": {"amount": 100, "unit": "g"},
+			            "caloriesKcal": 389,
+			            "proteinGrams": 16.9,
+			            "carbohydratesGrams": 66.3,
+			            "fatGrams": 6.9
+			          },
+			          "assumptions": ["dry rolled oats"]
 			        }
 			      ]
 			    }
 			  ],
-			  "fields": {},
-			  "confidence": 0.88
+			  "fields": [],
+			  "unresolvedFragments": [],
+			  "confidence": 0.95
 			}
 		""".trimIndent()
+		val INVALID_FRAGMENT_OUTPUT = VALID_COMPLETE_OUTPUT.replace("40 g avena", "41 g avena")
 		val FORBIDDEN_MODEL_CONTROLLED_FIELDS = setOf(
 			"userId",
 			"firebaseUid",
 			"date",
 			"dayId",
 			"captureId",
-			"mealId",
+			"entryId",
 			"itemId",
 			"sourceEventId",
 			"status",
@@ -509,26 +402,19 @@ class SpringAiDailyAiInterpreterTest {
 			"rejectedAt",
 		)
 
-		fun toolCall(
-			name: String,
-			arguments: String,
-			id: String = "call-1",
-		): AssistantMessage.ToolCall = AssistantMessage.ToolCall(id, "function", name, arguments)
-
-		fun toolResponse(vararg toolCalls: AssistantMessage.ToolCall): ChatResponse = ChatResponse(
-			listOf(Generation(toolMessage(*toolCalls))),
-		)
-
-		fun toolMessage(
-			vararg toolCalls: AssistantMessage.ToolCall,
-			text: String = "",
-		): AssistantMessage = AssistantMessage.builder()
-			.content(text)
-			.toolCalls(toolCalls.toList())
-			.build()
-
-		fun textResponse(text: String): ChatResponse = ChatResponse(
-			listOf(Generation(AssistantMessage(text))),
-		)
+		fun textResponse(
+			text: String,
+			promptTokens: Int? = null,
+			completionTokens: Int? = null,
+		): ChatResponse {
+			val metadata = ChatResponseMetadata.builder()
+				.apply {
+					if (promptTokens != null || completionTokens != null) {
+						usage(DefaultUsage(promptTokens ?: 0, completionTokens ?: 0))
+					}
+				}
+				.build()
+			return ChatResponse(listOf(Generation(AssistantMessage(text))), metadata)
+		}
 	}
 }

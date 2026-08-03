@@ -1,124 +1,117 @@
 package com.fitlake.daily.infrastructure.ai
 
+import com.fitlake.daily.application.ai.CaptureInterpreterPort
 import com.fitlake.daily.application.ai.DailyAiConfigurationException
-import com.fitlake.daily.application.ai.DailyAiInterpreter
 import com.fitlake.daily.application.ai.DailyAiProviderMetadata
-import com.fitlake.daily.application.ai.DailyAiRequestContext
-import com.fitlake.daily.application.ai.DailyAiResult
-import com.fitlake.daily.application.ai.DailyAiTerminalService
+import com.fitlake.daily.application.ai.InterpretDailyMessageRequest
+import com.fitlake.daily.application.ai.InterpretedDailyMessage
+import com.fitlake.shared.logging.sanitizedForTechnicalLogging
+import org.slf4j.LoggerFactory
 import org.springframework.ai.chat.model.ChatModel
-import org.springframework.ai.model.tool.ToolCallingManager
 import org.springframework.beans.factory.ObjectProvider
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import org.springframework.core.env.Environment
 import org.springframework.core.io.ResourceLoader
-import org.slf4j.LoggerFactory
 import java.io.IOException
-import java.net.URI
 import java.nio.charset.StandardCharsets
 
 @Configuration(proxyBeanMethods = false)
 class DailyAiSpringConfiguration {
+	@Bean
+	fun openAiSdkLoggingSafety(): OpenAiSdkLoggingSafety {
+		requireOpenAiSdkLoggingDisabled(System.getenv(OPENAI_SDK_LOG_LEVEL_ENV))
+		return OpenAiSdkLoggingSafety()
+	}
 
 	@Bean
-	@ConditionalOnMissingBean(DailyAiInterpreter::class)
+	@ConditionalOnMissingBean(CaptureInterpreterPort::class)
 	fun dailyAiInterpreter(
 		chatModelProvider: ObjectProvider<ChatModel>,
-		toolCallingManagerProvider: ObjectProvider<ToolCallingManager>,
-		terminalServiceProvider: ObjectProvider<DailyAiTerminalService>,
 		resourceLoader: ResourceLoader,
 		environment: Environment,
-	): DailyAiInterpreter {
+	): CaptureInterpreterPort {
 		val chatModel = chatModelProvider.ifUnique
-		val toolCallingManager = toolCallingManagerProvider.ifUnique
-		val terminalService = terminalServiceProvider.ifUnique
 		val apiKeyPresent = environment.firstConfiguredProperty(
 			"spring.ai.openai.chat.api-key",
 			"spring.ai.openai.api-key",
 		) != null
 		val configuredModel = environment.firstConfiguredProperty("spring.ai.openai.chat.model")
 		val maxOutputTokens = environment.dailyAiMaxOutputTokens()
+		val maxCorrectionRetries = environment.dailyAiMaxStructuredOutputRetries()
+		val nativeStructuredOutputEnabled = environment.dailyAiNativeStructuredOutputEnabled()
+		val baseUrlConfigured = environment.firstConfiguredProperty(
+			"spring.ai.openai.chat.base-url",
+			"spring.ai.openai.base-url",
+		) != null
 
-		val unavailableComponents = buildList {
-			if (chatModel == null) {
-				add(chatModelProvider.unavailableDescription("ChatModel"))
-			}
-			if (toolCallingManager == null) {
-				add(toolCallingManagerProvider.unavailableDescription("ToolCallingManager"))
-			}
-			if (terminalService == null) {
-				add(terminalServiceProvider.unavailableDescription("DailyAiTerminalService"))
-			}
+		if (chatModel == null) {
+			logger.atWarn()
+				.addKeyValue("event", "daily_ai_configuration_unavailable")
+				.addKeyValue("outcome", "failure")
+				.addKeyValue("errorCode", "AI_CHAT_MODEL_UNAVAILABLE")
+				.addKeyValue("reason", chatModelProvider.unavailableDescription("ChatModel"))
+				.addKeyValue("chatMode", environment.propertyDisplayValue("spring.ai.model.chat"))
+				.addKeyValue("apiKeyConfigured", apiKeyPresent)
+				.addKeyValue("modelConfigured", configuredModel != null)
+				.log("Daily AI configuration is unavailable")
+			return UnavailableCaptureInterpreter()
 		}
-		if (unavailableComponents.isNotEmpty()) {
-			logger.warn(
-				"Daily AI is unavailable: {}. Configuration: spring.ai.model.chat={}, " +
-					"apiKeyPresent={}, configuredModel={}",
-				unavailableComponents.joinToString(),
-				environment.propertyDisplayValue("spring.ai.model.chat"),
-				apiKeyPresent,
-				configuredModel ?: NOT_CONFIGURED,
-			)
-			return UnavailableDailyAiInterpreter()
-		}
-		val availableChatModel = requireNotNull(chatModel)
-		val availableToolCallingManager = requireNotNull(toolCallingManager)
-		val availableTerminalService = requireNotNull(terminalService)
 		if (!apiKeyPresent) {
-			logger.warn(
-				"Daily AI is unavailable: no usable OpenAI-compatible API key was found. " +
-					"Set OPENAI_API_KEY or spring.ai.openai.api-key; values that are blank, 'none', " +
-					"or unresolved placeholders are treated as missing. Configuration: " +
-					"spring.ai.model.chat={}, configuredModel={}",
-				environment.propertyDisplayValue("spring.ai.model.chat"),
-				configuredModel ?: NOT_CONFIGURED,
-			)
-			return UnavailableDailyAiInterpreter()
+			logger.atWarn()
+				.addKeyValue("event", "daily_ai_configuration_unavailable")
+				.addKeyValue("outcome", "failure")
+				.addKeyValue("errorCode", "AI_API_KEY_MISSING")
+				.addKeyValue("chatMode", environment.propertyDisplayValue("spring.ai.model.chat"))
+				.addKeyValue("apiKeyConfigured", false)
+				.addKeyValue("modelConfigured", configuredModel != null)
+				.log("Daily AI configuration is unavailable")
+			return UnavailableCaptureInterpreter()
 		}
 
 		val systemPrompt = try {
 			resourceLoader.getResource(DAILY_AI_PROMPT_RESOURCE).getContentAsString(StandardCharsets.UTF_8)
 		} catch (exception: IOException) {
-			logger.error(
-				"Daily AI is unavailable: system prompt could not be read from {} (exceptionType={})",
-				DAILY_AI_PROMPT_RESOURCE,
-				exception.javaClass.simpleName,
-				exception,
-			)
-			return UnavailableDailyAiInterpreter(exception)
+			logger.atError()
+				.addKeyValue("event", "daily_ai_configuration_unavailable")
+				.addKeyValue("outcome", "failure")
+				.addKeyValue("errorCode", "AI_PROMPT_UNREADABLE")
+				.addKeyValue("promptVersion", DAILY_AI_PROMPT_VERSION)
+				.addKeyValue("exceptionType", exception.javaClass.name)
+				.setCause(exception.sanitizedForTechnicalLogging())
+				.log("Daily AI system prompt could not be read")
+			return UnavailableCaptureInterpreter(exception)
 		}
 		val model = configuredModel
-			?: runCatching { availableChatModel.options.model }.getOrNull().configuredValue()
+			?: runCatching { chatModel.options.model }.getOrNull().configuredValue()
 			?: run {
-				logger.warn(
-					"Daily AI is unavailable: no usable chat model was configured. " +
-						"Set SPRING_AI_OPENAI_CHAT_MODEL or spring.ai.openai.chat.model. " +
-						"Configuration: spring.ai.model.chat={}, apiKeyPresent={}",
-					environment.propertyDisplayValue("spring.ai.model.chat"),
-					apiKeyPresent,
-				)
-				return UnavailableDailyAiInterpreter()
+				logger.atWarn()
+					.addKeyValue("event", "daily_ai_configuration_unavailable")
+					.addKeyValue("outcome", "failure")
+					.addKeyValue("errorCode", "AI_MODEL_MISSING")
+					.addKeyValue("chatMode", environment.propertyDisplayValue("spring.ai.model.chat"))
+					.addKeyValue("apiKeyConfigured", apiKeyPresent)
+					.log("Daily AI configuration is unavailable")
+				return UnavailableCaptureInterpreter()
 			}
 
-		logger.info(
-			"Daily AI configured: provider=OPENAI_COMPATIBLE, model={}, promptVersion={}, " +
-				"spring.ai.model.chat={}, apiKeyPresent=true, baseUrl={}, maxTokens={}",
-			model,
-			DAILY_AI_PROMPT_VERSION,
-			environment.propertyDisplayValue("spring.ai.model.chat"),
-			environment.firstConfiguredProperty(
-				"spring.ai.openai.chat.base-url",
-				"spring.ai.openai.base-url",
-			)?.safeEndpointDisplay() ?: NOT_CONFIGURED,
-			maxOutputTokens,
-		)
+		logger.atInfo()
+			.addKeyValue("event", "daily_ai_configured")
+			.addKeyValue("outcome", "success")
+			.addKeyValue("provider", "OPENAI_COMPATIBLE")
+			.addKeyValue("model", model)
+			.addKeyValue("promptVersion", DAILY_AI_PROMPT_VERSION)
+			.addKeyValue("chatMode", environment.propertyDisplayValue("spring.ai.model.chat"))
+			.addKeyValue("apiKeyConfigured", true)
+			.addKeyValue("baseUrlConfigured", baseUrlConfigured)
+			.addKeyValue("maxOutputTokens", maxOutputTokens)
+			.addKeyValue("maxStructuredOutputRetries", maxCorrectionRetries)
+			.addKeyValue("nativeStructuredOutputEnabled", nativeStructuredOutputEnabled)
+			.log("Daily AI configured")
 
 		return SpringAiDailyAiInterpreter(
-			chatModel = availableChatModel,
-			toolCallingManager = availableToolCallingManager,
-			terminalService = availableTerminalService,
+			chatModel = chatModel,
 			systemPrompt = systemPrompt,
 			metadata = DailyAiProviderMetadata(
 				provider = "OPENAI_COMPATIBLE",
@@ -126,6 +119,8 @@ class DailyAiSpringConfiguration {
 				promptVersion = DAILY_AI_PROMPT_VERSION,
 			),
 			maxOutputTokens = maxOutputTokens,
+			maxCorrectionRetries = maxCorrectionRetries,
+			nativeStructuredOutputEnabled = nativeStructuredOutputEnabled,
 		)
 	}
 
@@ -161,6 +156,28 @@ class DailyAiSpringConfiguration {
 			)
 	}
 
+	private fun Environment.dailyAiMaxStructuredOutputRetries(): Int {
+		val configured = runCatching { getProperty(DAILY_AI_STRUCTURED_OUTPUT_RETRIES_PROPERTY) }
+			.getOrNull()
+			.configuredValue()
+			?: return DEFAULT_DAILY_AI_MAX_CORRECTION_RETRIES
+		return configured.toIntOrNull()
+			?.takeIf { it in 0..MAX_DAILY_AI_MAX_CORRECTION_RETRIES }
+			?: throw IllegalStateException(
+				"$DAILY_AI_STRUCTURED_OUTPUT_RETRIES_PROPERTY must be an integer between 0 and " +
+					MAX_DAILY_AI_MAX_CORRECTION_RETRIES,
+			)
+	}
+
+	private fun Environment.dailyAiNativeStructuredOutputEnabled(): Boolean {
+		val configured = runCatching { getProperty(DAILY_AI_NATIVE_STRUCTURED_OUTPUT_PROPERTY) }
+			.getOrNull()
+			.configuredValue()
+			?: return false
+		return configured.toBooleanStrictOrNull()
+			?: throw IllegalStateException("$DAILY_AI_NATIVE_STRUCTURED_OUTPUT_PROPERTY must be true or false")
+	}
+
 	private fun <T : Any> ObjectProvider<T>.unavailableDescription(componentName: String): String {
 		val candidateCount = runCatching { stream().count() }.getOrNull()
 		return when (candidateCount) {
@@ -170,28 +187,36 @@ class DailyAiSpringConfiguration {
 		}
 	}
 
-	private fun String.safeEndpointDisplay(): String = runCatching {
-		val uri = URI(this)
-		require(uri.scheme != null && uri.host != null)
-		URI(uri.scheme, null, uri.host, uri.port, uri.path, null, null).toString()
-	}.getOrDefault("<configured but invalid URI>")
-
 	companion object {
 		private const val NOT_CONFIGURED = "<not configured>"
+		private const val OPENAI_SDK_LOG_LEVEL_ENV = "OPENAI_LOG"
+		private const val DAILY_AI_STRUCTURED_OUTPUT_RETRIES_PROPERTY =
+			"fitlake.daily.ai.max-structured-output-retries"
+		private const val DAILY_AI_NATIVE_STRUCTURED_OUTPUT_PROPERTY =
+			"fitlake.daily.ai.native-structured-output-enabled"
 		private val logger = LoggerFactory.getLogger(DailyAiSpringConfiguration::class.java)
 	}
 }
 
-private class UnavailableDailyAiInterpreter(
+class OpenAiSdkLoggingSafety internal constructor()
+
+internal fun requireOpenAiSdkLoggingDisabled(configuredLevel: String?) {
+	val normalizedLevel = configuredLevel?.trim()
+	check(normalizedLevel.isNullOrEmpty() || normalizedLevel.equals("off", ignoreCase = true)) {
+		"OPENAI_LOG must remain off because SDK HTTP logging can expose private request and response data"
+	}
+}
+
+private class UnavailableCaptureInterpreter(
 	private val cause: Throwable? = null,
-) : DailyAiInterpreter {
+) : CaptureInterpreterPort {
 	override val metadata = DailyAiProviderMetadata(
 		provider = "UNAVAILABLE",
 		model = "unavailable",
 		promptVersion = DAILY_AI_PROMPT_VERSION,
 	)
 
-	override fun interpret(context: DailyAiRequestContext, text: String): DailyAiResult {
+	override fun interpret(request: InterpretDailyMessageRequest): InterpretedDailyMessage {
 		throw DailyAiConfigurationException(cause)
 	}
 }

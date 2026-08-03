@@ -30,6 +30,7 @@ import com.fitlake.daily.domain.capture.MealDraft
 import com.fitlake.daily.domain.capture.MealItemDraft
 import com.fitlake.daily.domain.common.DailyDayStatus
 import com.fitlake.daily.domain.metrics.DailyMetrics
+import io.swagger.v3.oas.annotations.media.Schema
 import jakarta.validation.Valid
 import jakarta.validation.constraints.NotNull
 import jakarta.validation.constraints.Positive
@@ -82,6 +83,10 @@ data class DailyCaptureEntryRequest(
 
 data class DailyFoodItemRequest(
 	val itemId: UUID? = null,
+	@field:Schema(
+		description = "USER_FOOD is required for new manual items. AI_ESTIMATE is accepted only during full PUT " +
+			"replacement to preserve an existing unchanged AI item; it cannot create or edit an estimate.",
+	)
 	val sourceType: DailyFoodItemRequestSourceType,
 	val userFoodId: UUID?,
 	@field:Valid val quantity: DailyFoodQuantityRequest,
@@ -204,6 +209,7 @@ data class DailyCaptureResponse(
 	val captureType: DailyCaptureType,
 	val status: DailyCaptureStatus,
 	val payload: DailyCapturePayloadResponse,
+	val nutritionTotal: DailyNutritionValuesResponse?,
 	val createdBy: DailyCaptureActor,
 	val updatedBy: DailyCaptureActor?,
 	val acceptedAt: Instant?,
@@ -255,6 +261,7 @@ fun DailyCapture.toResponse(): DailyCaptureResponse = DailyCaptureResponse(
 	captureType = captureType,
 	status = status,
 	payload = payload.toResponse(),
+	nutritionTotal = payload.captureNutritionTotal()?.toResponse(),
 	createdBy = createdBy,
 	updatedBy = updatedBy,
 	acceptedAt = acceptedAt,
@@ -269,6 +276,14 @@ internal fun DailyCapturePayload.toResponse(): DailyCapturePayloadResponse = Dai
 	schemaVersion = schemaVersion,
 	entries = entries.map(DailyCaptureEntry::toResponse),
 )
+
+private fun DailyCapturePayload.captureNutritionTotal(): DailyNutritionValues? {
+	val foodEntryTotals = entries
+		.filter { it.type == DailyCaptureEntryType.FOOD }
+		.map { checkNotNull(it.nutritionTotal) { "FOOD entry requires a nutrition total" } }
+	return foodEntryTotals.takeIf(List<DailyNutritionValues>::isNotEmpty)
+		?.let(DailyNutritionValues::strictTotal)
+}
 
 fun DailyMetrics.toResponse(): DailyMetricsResponse = DailyMetricsResponse(
 	dayId = dayId.value,

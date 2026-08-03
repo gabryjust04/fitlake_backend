@@ -163,9 +163,13 @@ class DailyManualCaptureConcurrencyIntegrationTest @Autowired constructor(
 		assertEquals(created.version + 1, persisted.version)
 		assertEquals(winnerCapture.version, persisted.version)
 		assertEquals(winnerCapture.payload, persisted.payload)
-		assertEquals(1, persistedAudits.size)
+		assertEquals(2, persistedAudits.size)
 
-		val audit = persistedAudits.single()
+		val createAudit = persistedAudits.single { it.action == DailyCaptureAuditAction.CREATE }
+		assertEquals(created.version, createAudit.newVersion)
+		assertEquals(created.payload, createAudit.newPayload)
+
+		val audit = persistedAudits.single { it.action == DailyCaptureAuditAction.UI_EDIT }
 		assertEquals(DailyCaptureAuditAction.UI_EDIT, audit.action)
 		assertEquals(created.version, audit.oldVersion)
 		assertEquals(persisted.version, audit.newVersion)

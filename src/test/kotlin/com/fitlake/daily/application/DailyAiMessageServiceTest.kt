@@ -1,8 +1,10 @@
 package com.fitlake.daily.application
 
-import com.fitlake.daily.application.ai.AiCaptureProposal
-import com.fitlake.daily.application.ai.AiFoodItemProposal
-import com.fitlake.daily.application.ai.AiMealProposal
+import ch.qos.logback.classic.Level
+import com.fitlake.daily.application.ai.AiFoodInterpretation
+import com.fitlake.daily.application.ai.AiFoodQuantity
+import com.fitlake.daily.application.ai.AiMealInterpretation
+import com.fitlake.daily.application.ai.AiNutritionEstimate
 import com.fitlake.daily.application.ai.DailyAiAuditService
 import com.fitlake.daily.application.ai.DailyAiCaptureProposalFactory
 import com.fitlake.daily.application.ai.DailyAiIdempotencyConflictException
@@ -15,6 +17,9 @@ import com.fitlake.daily.application.ai.DailyAiProviderMetadata
 import com.fitlake.daily.application.ai.DailyAiRequestContext
 import com.fitlake.daily.application.ai.DailyAiResult
 import com.fitlake.daily.application.ai.DailyAiTerminalService
+import com.fitlake.daily.application.ai.DailyMessageInterpretation
+import com.fitlake.daily.application.ai.DailyMessageInterpretationOutcome
+import com.fitlake.daily.application.ai.InterpretedDailyMessage
 import com.fitlake.daily.application.capture.DailyCaptureService
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchPort
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchResult
@@ -34,11 +39,15 @@ import com.fitlake.support.DailyAiScript
 import com.fitlake.support.ImmediateTransactionExecutor
 import com.fitlake.support.InMemoryAiInterpretationLogRepository
 import com.fitlake.support.InMemoryDailyCaptureRepository
+import com.fitlake.support.InMemoryDailyCaptureAuditRepository
 import com.fitlake.support.InMemoryDailyDayRepository
 import com.fitlake.support.InMemoryDailyInboxEventRepository
 import com.fitlake.support.InMemoryUserAccountRepository
+import com.fitlake.support.LogEventCapture
 import com.fitlake.support.ScriptedDailyAiInterpreter
 import com.fitlake.support.dailyFieldsPayload
+import com.fitlake.support.renderedLogContent
+import com.fitlake.support.structuredFields
 import com.fitlake.user.application.UserQueryService
 import com.fitlake.user.domain.UserAccount
 import com.fitlake.user.domain.UserId
@@ -53,6 +62,7 @@ import java.time.ZoneId
 import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
@@ -70,6 +80,7 @@ class DailyAiMessageServiceTest {
 	private lateinit var captures: InMemoryDailyCaptureRepository
 	private lateinit var inboxEvents: InMemoryDailyInboxEventRepository
 	private lateinit var interpretationLogs: InMemoryAiInterpretationLogRepository
+	private lateinit var captureAudits: InMemoryDailyCaptureAuditRepository
 	private lateinit var users: InMemoryUserAccountRepository
 	private lateinit var captureService: DailyCaptureService
 	private lateinit var auditService: DailyAiAuditService
@@ -83,6 +94,7 @@ class DailyAiMessageServiceTest {
 		captures = InMemoryDailyCaptureRepository()
 		inboxEvents = InMemoryDailyInboxEventRepository()
 		interpretationLogs = InMemoryAiInterpretationLogRepository()
+		captureAudits = InMemoryDailyCaptureAuditRepository()
 		users = InMemoryUserAccountRepository().also {
 			it.save(account(userId))
 			it.save(account(otherUserId))
@@ -106,15 +118,17 @@ class DailyAiMessageServiceTest {
 			captureRepository = captures,
 			inboxEventRepository = inboxEvents,
 			interpretationLogRepository = interpretationLogs,
+			captureAuditRepository = captureAudits,
 			captureService = captureService,
 			proposalFactory = DailyAiCaptureProposalFactory(noCatalogMatches()),
 			transactionExecutor = ImmediateTransactionExecutor,
 			clock = clock,
 		)
-		interpreter = ScriptedDailyAiInterpreter(terminalService)
+		interpreter = ScriptedDailyAiInterpreter()
 		messageService = DailyAiMessageService(
 			auditService = auditService,
 			interpreter = interpreter,
+			terminalService = terminalService,
 			userQueryService = UserQueryService(users),
 			maxTextLength = 4000,
 		)
@@ -122,11 +136,17 @@ class DailyAiMessageServiceTest {
 
 	@Test
 	fun `valid text creates an AI owned open capture for the authenticated user and requested date`() {
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		val privateFoodFragment = "PRIVATE_AI_FOOD_FRAGMENT_d1e3"
+		val rawText = "40 grammi di $privateFoodFragment a colazione"
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal(privateFoodFragment)))
 
-		val result = assertIs<DailyAiResult.CaptureCreated>(
-			messageService.submitMessage(userId, date, "message-1", "40 grammi di avena a colazione"),
-		)
+		lateinit var result: DailyAiResult.CaptureCreated
+		val logEvents = LogEventCapture(DailyAiMessageService::class.java).use { logs ->
+			result = assertIs<DailyAiResult.CaptureCreated>(
+				messageService.submitMessage(userId, date, "message-1", rawText),
+			)
+			logs.events
+		}
 
 		val capture = result.capture
 		assertEquals(date, result.date)
@@ -138,7 +158,7 @@ class DailyAiMessageServiceTest {
 		assertEquals(DAILY_CAPTURE_SCHEMA_VERSION, capture.payload.schemaVersion)
 		val foodItem = capture.payload.entries.single().items.single()
 		assertEquals(DailyFoodItemSourceType.AI_ESTIMATE, foodItem.sourceType)
-		assertEquals("150", foodItem.calculatedNutrition.caloriesKcal?.toPlainString())
+		assertEquals(0, BigDecimal("150").compareTo(requireNotNull(foodItem.calculatedNutrition.caloriesKcal)))
 		assertEquals(foodItem.itemId.toString(), capture.payload.meals.single().items.single().itemTempId)
 		assertEquals(date, days.findById(capture.dayId)?.dayDate)
 		assertEquals(1, captures.count())
@@ -148,13 +168,41 @@ class DailyAiMessageServiceTest {
 		assertEquals(AiInterpretationStatus.SUCCESS, interpretationLog.status)
 		val nutritionResolutions = interpretationLog.parsedOutput["nutritionResolutions"] as List<*>
 		assertEquals("NO_MATCH", (nutritionResolutions.single() as Map<*, *>)["outcome"])
+
+		val completionFields = logEvents
+			.single { it.structuredFields()["event"] == "daily_ai_interpretation_completed" }
+			.structuredFields()
+		assertEquals("success", completionFields["outcome"])
+		assertEquals(userId.value, completionFields["userRef"])
+		assertEquals("test-provider", completionFields["provider"])
+		assertEquals("test-model", completionFields["model"])
+		assertEquals("test-prompt-v3", completionFields["promptVersion"])
+		assertEquals(DailyMessageInterpretationOutcome.COMPLETE, completionFields["interpretationStatus"])
+		assertEquals(1, completionFields["foodMentionCount"])
+		assertEquals(0, completionFields["personalFoodMatchCount"])
+		assertEquals(1, completionFields["aiFallbackCount"])
+		assertEquals(0, completionFields["unresolvedFragmentCount"])
+		assertEquals(0, completionFields["retryCount"])
+		assertEquals(capture.captureId.value, completionFields["captureId"])
+		assertEquals(1, completionFields["entryCount"])
+		assertEquals(1, completionFields["foodItemCount"])
+		assertTrue(completionFields["durationMs"] is Long)
+		assertFalse(completionFields.containsKey("payload"))
+		assertFalse(completionFields.containsKey("originalFragment"))
+		assertFalse(completionFields.containsKey("nutritionEstimate"))
+		val fallbackFields = logEvents
+			.single { it.structuredFields()["event"] == "daily_ai_estimate_fallback_used" }
+			.structuredFields()
+		assertEquals("fallback", fallbackFields["outcome"])
+		assertEquals(1, fallbackFields["aiFallbackCount"])
+		val renderedLogs = logEvents.renderedLogContent()
+		assertFalse(renderedLogs.contains(rawText))
+		assertFalse(renderedLogs.contains(privateFoodFragment))
 	}
 
 	@Test
 	fun `AI note insertion persists and replays only schema v2 entries`() {
-		interpreter.script(
-			DailyAiScript.CreateCapture(AiCaptureProposal(type = "NOTE", note = "Giornata tranquilla")),
-		)
+		interpreter.script(DailyAiScript.Unresolved)
 
 		val created = assertIs<DailyAiResult.CaptureCreated>(
 			messageService.submitMessage(userId, date, "note-v2", "Giornata tranquilla"),
@@ -172,7 +220,7 @@ class DailyAiMessageServiceTest {
 
 	@Test
 	fun `same completed message is replayed without another AI call or duplicate capture`() {
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 
 		val first = assertIs<DailyAiResult.CaptureCreated>(
 			messageService.submitMessage(userId, date, "message-retry", "avena 40 g"),
@@ -189,21 +237,21 @@ class DailyAiMessageServiceTest {
 	}
 
 	@Test
-	fun `idempotent replay returns the original open snapshot after the capture changes state`() {
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+	fun `idempotent replay returns the established capture current lifecycle state without another AI call`() {
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 		val first = assertIs<DailyAiResult.CaptureCreated>(
 			messageService.submitMessage(userId, date, "message-snapshot", "avena 40 g"),
 		)
 		val persisted = requireNotNull(captures.findById(first.capture.captureId))
-		captures.save(persisted.accept(now.plusSeconds(1)))
+		val accepted = captures.save(persisted.accept(now.plusSeconds(1)))
 
 		val replay = assertIs<DailyAiResult.CaptureCreated>(
 			messageService.submitMessage(userId, date, "message-snapshot", "avena 40 g"),
 		)
 
-		assertEquals(DailyCaptureStatus.OPEN, replay.capture.status)
+		assertEquals(DailyCaptureStatus.ACCEPTED, replay.capture.status)
 		assertEquals(first.capture.payload, replay.capture.payload)
-		assertEquals(first.capture.version, replay.capture.version)
+		assertEquals(accepted.version, replay.capture.version)
 		assertEquals(DailyCaptureStatus.ACCEPTED, captures.findById(first.capture.captureId)?.status)
 		assertEquals(1, interpreter.callCount)
 	}
@@ -218,13 +266,13 @@ class DailyAiMessageServiceTest {
 				dayId = day.dayId,
 				channel = DailyInboxChannel.REST_AI_MESSAGE,
 				sourceMessageId = "stale-message",
-				rawText = "avena 40 g",
+				rawText = "avena   40 g",
 				normalizedText = "avena 40 g",
 				replacesCaptureId = null,
 				at = staleAt,
 			),
 		)
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 
 		val result = assertIs<DailyAiResult.CaptureCreated>(
 			messageService.submitMessage(userId, date, "stale-message", "avena 40 g"),
@@ -232,6 +280,8 @@ class DailyAiMessageServiceTest {
 
 		assertEquals(DailyCaptureStatus.OPEN, result.capture.status)
 		assertEquals(DailyInboxProcessingStatus.PROCESSED, inboxEvents.all().single().processingStatus)
+		assertEquals("avena   40 g", inboxEvents.all().single().rawText)
+		assertEquals("avena   40 g", interpreter.requests.single().request.text)
 		assertEquals(1, interpreter.callCount)
 		assertEquals(1, captures.count())
 	}
@@ -251,7 +301,7 @@ class DailyAiMessageServiceTest {
 				at = now,
 			),
 		)
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 
 		assertFailsWith<DailyAiOperationInProgressException> {
 			messageService.submitMessage(userId, date, "fresh-message", "avena 40 g")
@@ -278,7 +328,7 @@ class DailyAiMessageServiceTest {
 				at = staleAt,
 			),
 		)
-		val metadata = DailyAiProviderMetadata("TEST", "test-model", "daily-capture-v2")
+		val metadata = DailyAiProviderMetadata("TEST", "test-model", "daily-capture-v3")
 		val staleContext = DailyAiRequestContext(
 			inboxEventId = event.inboxEventId,
 			userId = userId,
@@ -292,7 +342,7 @@ class DailyAiMessageServiceTest {
 		val renewed = inboxEvents.save(event.renewProcessing(now))
 
 		assertFailsWith<DailyAiOperationInProgressException> {
-			terminalService.createCapture(staleContext, validFoodProposal())
+			terminalService.complete(staleContext, "avena 40 g", InterpretedDailyMessage(validFoodProposal()))
 		}
 		auditService.recordFailure(
 			staleContext,
@@ -309,7 +359,7 @@ class DailyAiMessageServiceTest {
 			processingAttemptId = renewed.processingAttemptId,
 		)
 		val result = assertIs<DailyAiResult.CaptureCreated>(
-			terminalService.createCapture(currentContext, validFoodProposal()),
+			terminalService.complete(currentContext, "avena 40 g", InterpretedDailyMessage(validFoodProposal())),
 		)
 		assertEquals(DailyCaptureStatus.OPEN, result.capture.status)
 		assertEquals(1, captures.count())
@@ -317,7 +367,7 @@ class DailyAiMessageServiceTest {
 
 	@Test
 	fun `same idempotency key cannot be reused with different text`() {
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 		messageService.submitMessage(userId, date, "message-conflict", "avena 40 g")
 
 		assertFailsWith<DailyAiIdempotencyConflictException> {
@@ -329,36 +379,37 @@ class DailyAiMessageServiceTest {
 	}
 
 	@Test
-	fun `clarification records a terminal outcome without creating a capture`() {
-		interpreter.script(DailyAiScript.AskClarification("Quanta avena hai mangiato?"))
+	fun `relevant but unresolved input creates a note instead of asking clarification`() {
+		interpreter.script(DailyAiScript.Unresolved)
 
-		val result = assertIs<DailyAiResult.ClarificationRequired>(
+		val result = assertIs<DailyAiResult.CaptureCreated>(
 			messageService.submitMessage(userId, date, "clarification-1", "Ho mangiato avena"),
 		)
 
-		assertEquals("Quanta avena hai mangiato?", result.question)
-		assertEquals(0, captures.count())
+		assertEquals(DailyMessageInterpretationOutcome.UNRESOLVED, result.interpretationOutcome)
+		assertEquals("Ho mangiato avena", result.capture.payload.entries.single().text)
+		assertEquals(1, captures.count())
 		assertEquals(DailyInboxProcessingStatus.PROCESSED, inboxEvents.all().single().processingStatus)
-		assertEquals(AiInterpretationStatus.NEEDS_CLARIFICATION, interpretationLogs.all().single().status)
+		assertEquals(AiInterpretationStatus.SUCCESS, interpretationLogs.all().single().status)
 	}
 
 	@Test
 	fun `no op ignores the inbox event without creating a capture`() {
-		interpreter.script(DailyAiScript.NoOp("Il testo non contiene dati Daily"))
+		interpreter.script(DailyAiScript.NoRelevantData)
 
-		val result = assertIs<DailyAiResult.NoOp>(
+		val result = assertIs<DailyAiResult.NoRelevantData>(
 			messageService.submitMessage(userId, date, "noop-1", "Ciao come stai?"),
 		)
 
-		assertEquals("Il testo non contiene dati Daily", result.reason)
+		assertEquals("The message contains no relevant Daily data", result.reason)
 		assertEquals(0, captures.count())
 		assertEquals(DailyInboxProcessingStatus.IGNORED, inboxEvents.all().single().processingStatus)
-		assertEquals(AiInterpretationStatus.NO_OP, interpretationLogs.all().single().status)
+		assertEquals(AiInterpretationStatus.NO_RELEVANT_DATA, interpretationLogs.all().single().status)
 	}
 
 	@Test
 	fun `domain incompatible AI proposal is rejected without a partial capture`() {
-		interpreter.script(DailyAiScript.CreateCapture(AiCaptureProposal(type = "FOOD")))
+		interpreter.script(DailyAiScript.Fail(DailyAiInvalidOutputException()))
 
 		assertFailsWith<DailyAiInvalidOutputException> {
 			messageService.submitMessage(userId, date, "invalid-output-1", "colazione")
@@ -371,10 +422,19 @@ class DailyAiMessageServiceTest {
 
 	@Test
 	fun `provider failure leaves no capture and records a sanitized failure`() {
-		interpreter.script(DailyAiScript.Fail(DailyAiProviderUnavailableException(IllegalStateException("secret"))))
+		val rawText = "PRIVATE_AI_USER_TEXT_82f4"
+		val rawProviderResponse = "PRIVATE_RAW_PROVIDER_RESPONSE_85e2 Authorization Bearer secret-token"
+		interpreter.script(
+			DailyAiScript.Fail(
+				DailyAiProviderUnavailableException(IllegalStateException(rawProviderResponse)),
+			),
+		)
 
-		assertFailsWith<DailyAiProviderUnavailableException> {
-			messageService.submitMessage(userId, date, "provider-error-1", "avena 40 g")
+		val logEvents = LogEventCapture(DailyAiMessageService::class.java).use { logs ->
+			assertFailsWith<DailyAiProviderUnavailableException> {
+				messageService.submitMessage(userId, date, "provider-error-private", rawText)
+			}
+			logs.events
 		}
 
 		assertEquals(0, captures.count())
@@ -383,6 +443,24 @@ class DailyAiMessageServiceTest {
 		assertEquals(AiInterpretationStatus.FAILED, log.status)
 		assertEquals("AI_PROVIDER_UNAVAILABLE", log.errorCode)
 		assertEquals("The AI provider is unavailable", log.errorMessage)
+
+		val failureFields = logEvents.single().structuredFields()
+		assertEquals("daily_ai_interpretation_failed", failureFields["event"])
+		assertEquals("failure", failureFields["outcome"])
+		assertEquals("AI_PROVIDER_UNAVAILABLE", failureFields["errorCode"])
+		assertEquals(userId.value, failureFields["userRef"])
+		assertEquals("test-provider", failureFields["provider"])
+		assertEquals("test-model", failureFields["model"])
+		assertEquals("test-prompt-v3", failureFields["promptVersion"])
+		assertEquals(AiInterpretationStatus.FAILED, failureFields["interpretationStatus"])
+		assertEquals(DailyAiProviderUnavailableException::class.java.name, failureFields["exceptionType"])
+		assertTrue(failureFields["durationMs"] is Long)
+		assertFalse(failureFields.containsKey("errorMessage"))
+		assertFalse(failureFields.containsKey("rawResponse"))
+		val renderedLogs = logEvents.renderedLogContent()
+		assertFalse(renderedLogs.contains(rawText))
+		assertFalse(renderedLogs.contains(rawProviderResponse))
+		assertFalse(renderedLogs.contains("secret-token"))
 	}
 
 	@Test
@@ -404,7 +482,7 @@ class DailyAiMessageServiceTest {
 		val existing = captureService.createFromUser(userId, date, manualFieldsPayload())
 		val confirmed = requireNotNull(days.findById(existing.dayId)).confirm(now.plusSeconds(1))
 		days.save(confirmed)
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 
 		assertFailsWith<DailyConflictException> {
 			messageService.submitMessage(userId, date, "closed-day-1", "avena 40 g")
@@ -419,7 +497,7 @@ class DailyAiMessageServiceTest {
 	fun `valid reprocess creates a distinct open capture and marks the previous one replaced`() {
 		val previous = manualCapture()
 		val fullText = "A colazione ho mangiato avena, yogurt e tre biscotti"
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal("biscotti")))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal("biscotti")))
 
 		val result = assertIs<DailyAiResult.CaptureCreated>(
 			messageService.reprocess(userId, previous.captureId, "reprocess-1", fullText),
@@ -444,7 +522,7 @@ class DailyAiMessageServiceTest {
 	@Test
 	fun `successful reprocess is idempotently replayed`() {
 		val previous = manualCapture()
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal("biscotti")))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal("biscotti")))
 
 		val first = assertIs<DailyAiResult.CaptureCreated>(
 			messageService.reprocess(userId, previous.captureId, "reprocess-retry", "testo completo"),
@@ -474,9 +552,9 @@ class DailyAiMessageServiceTest {
 	}
 
 	@Test
-	fun `clarification during reprocess leaves the previous capture open`() {
+	fun `unresolved reprocess atomically replaces the previous capture with a note`() {
 		val previous = manualCapture()
-		interpreter.script(DailyAiScript.AskClarification("Quanti biscotti?"))
+		interpreter.script(DailyAiScript.Unresolved)
 
 		val result = messageService.reprocess(
 			userId,
@@ -485,15 +563,17 @@ class DailyAiMessageServiceTest {
 			"testo completo ambiguo",
 		)
 
-		assertIs<DailyAiResult.ClarificationRequired>(result)
-		assertEquals(DailyCaptureStatus.OPEN, captures.findById(previous.captureId)?.status)
-		assertEquals(1, captures.count())
+		val replacement = assertIs<DailyAiResult.CaptureCreated>(result)
+		assertEquals(DailyMessageInterpretationOutcome.UNRESOLVED, replacement.interpretationOutcome)
+		assertEquals(DailyCaptureStatus.REJECTED, captures.findById(previous.captureId)?.status)
+		assertEquals("testo completo ambiguo", replacement.capture.payload.entries.single().text)
+		assertEquals(2, captures.count())
 	}
 
 	@Test
 	fun `no op during reprocess leaves the previous capture open`() {
 		val previous = manualCapture()
-		interpreter.script(DailyAiScript.NoOp("Nessun dato utilizzabile"))
+		interpreter.script(DailyAiScript.NoRelevantData)
 
 		val result = messageService.reprocess(
 			userId,
@@ -502,7 +582,7 @@ class DailyAiMessageServiceTest {
 			"testo completo non utilizzabile",
 		)
 
-		assertIs<DailyAiResult.NoOp>(result)
+		assertIs<DailyAiResult.NoRelevantData>(result)
 		assertEquals(DailyCaptureStatus.OPEN, captures.findById(previous.captureId)?.status)
 		assertEquals(1, captures.count())
 	}
@@ -510,7 +590,7 @@ class DailyAiMessageServiceTest {
 	@Test
 	fun `invalid replacement proposal leaves the previous capture open`() {
 		val previous = manualCapture()
-		interpreter.script(DailyAiScript.CreateCapture(AiCaptureProposal(type = "UNSUPPORTED")))
+		interpreter.script(DailyAiScript.Fail(DailyAiInvalidOutputException()))
 
 		assertFailsWith<DailyAiInvalidOutputException> {
 			messageService.reprocess(userId, previous.captureId, "reprocess-invalid", "testo completo")
@@ -523,17 +603,26 @@ class DailyAiMessageServiceTest {
 	@Test
 	fun `failure while saving the replacement leaves the previous capture open`() {
 		val previous = manualCapture()
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal("biscotti")))
-		captures.failureOnNextSave = DataAccessResourceFailureException("simulated write failure")
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal("biscotti")))
+		val privatePersistenceDetail = "PRIVATE_DATABASE_ROW_DETAIL_42"
+		captures.failureOnNextSave = DataAccessResourceFailureException(privatePersistenceDetail)
 
-		assertFailsWith<DailyAiPersistenceException> {
-			messageService.reprocess(userId, previous.captureId, "reprocess-write-failure", "testo completo")
+		val logEvents = LogEventCapture(DailyAiMessageService::class.java).use { logs ->
+			assertFailsWith<DailyAiPersistenceException> {
+				messageService.reprocess(userId, previous.captureId, "reprocess-write-failure", "testo completo")
+			}
+			logs.events
 		}
 
 		assertEquals(DailyCaptureStatus.OPEN, captures.findById(previous.captureId)?.status)
 		assertNull(captures.all().single().sourceEventId)
 		assertEquals(1, captures.count())
 		assertEquals(DailyInboxProcessingStatus.FAILED, inboxEvents.all().single().processingStatus)
+		val failure = logEvents.single { it.structuredFields()["event"] == "daily_ai_interpretation_failed" }
+		assertEquals(Level.ERROR, failure.level)
+		assertEquals("AI_PERSISTENCE_ERROR", failure.structuredFields()["errorCode"])
+		assertNotNull(failure.throwableProxy)
+		assertFalse(logEvents.renderedLogContent().contains(privatePersistenceDetail))
 	}
 
 	@Test
@@ -602,20 +691,24 @@ class DailyAiMessageServiceTest {
 		assertEquals(0, inboxEvents.count())
 	}
 
-	private fun validFoodProposal(foodName: String = "avena") = AiCaptureProposal(
-		type = "FOOD",
+	private fun validFoodProposal(foodName: String = "avena") = DailyMessageInterpretation(
+		outcome = DailyMessageInterpretationOutcome.COMPLETE,
 		meals = listOf(
-			AiMealProposal(
+			AiMealInterpretation(
 				mealName = "colazione",
 				items = listOf(
-					AiFoodItemProposal(
-						foodName = foodName,
-						quantity = BigDecimal("40"),
-						unit = "grammi",
-						calories = BigDecimal("150"),
-						proteinG = BigDecimal("5"),
-						carbsG = BigDecimal("27"),
-						fatG = BigDecimal("3"),
+					AiFoodInterpretation(
+						originalFragment = foodName,
+						searchText = foodName,
+						statedQuantity = AiFoodQuantity(BigDecimal("40"), "grammi"),
+						estimatedQuantity = AiFoodQuantity(BigDecimal("40"), "g"),
+						nutritionEstimate = AiNutritionEstimate(
+							basis = AiFoodQuantity(BigDecimal("40"), "g"),
+							caloriesKcal = BigDecimal("150"),
+							proteinGrams = BigDecimal("5"),
+							carbohydratesGrams = BigDecimal("27"),
+							fatGrams = BigDecimal("3"),
+						),
 					),
 				),
 			),

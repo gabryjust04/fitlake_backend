@@ -9,14 +9,17 @@ import com.fitlake.auth.infrastructure.firebase.FirebaseAuthenticationFilter
 import com.fitlake.auth.infrastructure.firebase.FirebaseTokenClaims
 import com.fitlake.auth.infrastructure.firebase.FirebaseTokenVerificationException
 import com.fitlake.auth.infrastructure.firebase.FirebaseTokenVerifier
-import com.fitlake.daily.application.ai.AiCaptureProposal
-import com.fitlake.daily.application.ai.AiFoodItemProposal
-import com.fitlake.daily.application.ai.AiMealProposal
+import com.fitlake.daily.application.ai.AiFoodInterpretation
+import com.fitlake.daily.application.ai.AiFoodQuantity
+import com.fitlake.daily.application.ai.AiMealInterpretation
+import com.fitlake.daily.application.ai.AiNutritionEstimate
 import com.fitlake.daily.application.ai.DailyAiAuditService
 import com.fitlake.daily.application.ai.DailyAiCaptureProposalFactory
 import com.fitlake.daily.application.ai.DailyAiMessageService
 import com.fitlake.daily.application.ai.DailyAiProviderUnavailableException
 import com.fitlake.daily.application.ai.DailyAiTerminalService
+import com.fitlake.daily.application.ai.DailyMessageInterpretation
+import com.fitlake.daily.application.ai.DailyMessageInterpretationOutcome
 import com.fitlake.daily.application.capture.DailyCaptureService
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchPort
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchResult
@@ -26,6 +29,7 @@ import com.fitlake.support.DailyAiScript
 import com.fitlake.support.ImmediateTransactionExecutor
 import com.fitlake.support.InMemoryAiInterpretationLogRepository
 import com.fitlake.support.InMemoryDailyCaptureRepository
+import com.fitlake.support.InMemoryDailyCaptureAuditRepository
 import com.fitlake.support.InMemoryDailyDayRepository
 import com.fitlake.support.InMemoryDailyInboxEventRepository
 import com.fitlake.support.InMemoryUserAccountRepository
@@ -90,7 +94,7 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 
 	@Test
 	fun `message endpoint creates an open capture and idempotently replays it`() {
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 
 		val first = postMessage(
 			date = "2026-07-30",
@@ -131,27 +135,28 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 	}
 
 	@Test
-	fun `message endpoint returns clarification without a capture`() {
-		interpreter.script(DailyAiScript.AskClarification("Quanti grammi di riso?"))
+	fun `message endpoint creates an unresolved note instead of clarification`() {
+		interpreter.script(DailyAiScript.Unresolved)
 
 		postMessage("2026-07-31", "rest-clarification-1", "Ho mangiato riso").andExpect {
-			status { isOk() }
-			jsonPath("$.outcome") { value("CLARIFICATION_REQUIRED") }
-			jsonPath("$.question") { value("Quanti grammi di riso?") }
-			jsonPath("$.capture") { isEmpty() }
+			status { isCreated() }
+			jsonPath("$.outcome") { value("CAPTURE_CREATED") }
+			jsonPath("$.interpretationOutcome") { value("UNRESOLVED") }
+			jsonPath("$.capture.payload.entries[0].type") { value("NOTE") }
+			jsonPath("$.capture.payload.entries[0].text") { value("Ho mangiato riso") }
 		}
 
-		assertEquals(0, captures.count())
+		assertEquals(1, captures.count())
 	}
 
 	@Test
-	fun `message endpoint returns no op without a capture`() {
-		interpreter.script(DailyAiScript.NoOp("Nessun dato Daily"))
+	fun `message endpoint returns no relevant data without a capture`() {
+		interpreter.script(DailyAiScript.NoRelevantData)
 
 		postMessage("2026-08-01", "rest-noop-1", "Ciao").andExpect {
 			status { isOk() }
-			jsonPath("$.outcome") { value("NO_OP") }
-			jsonPath("$.reason") { value("Nessun dato Daily") }
+			jsonPath("$.outcome") { value("NO_RELEVANT_DATA") }
+			jsonPath("$.reason") { value("The message contains no relevant Daily data") }
 			jsonPath("$.capture") { isEmpty() }
 		}
 
@@ -220,10 +225,10 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 
 	@Test
 	fun `reprocess endpoint creates a new capture and replaces the old proposal`() {
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 		val original = postMessage("2026-08-05", "original-1", "avena 40 g")
 		val oldId = captureId(original.andReturn().response.contentAsString)
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal("biscotti")))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal("biscotti")))
 
 		val replacement = mockMvc.post("/api/daily/captures/$oldId/reprocess") {
 			auth("valid-a")
@@ -246,11 +251,11 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 	}
 
 	@Test
-	fun `clarification on reprocess preserves the old open proposal`() {
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+	fun `unresolved reprocess replaces the old proposal with an exact note`() {
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 		val original = postMessage("2026-08-06", "original-clarification", "avena 40 g")
 		val oldId = captureId(original.andReturn().response.contentAsString)
-		interpreter.script(DailyAiScript.AskClarification("Quanti biscotti?"))
+		interpreter.script(DailyAiScript.Unresolved)
 
 		mockMvc.post("/api/daily/captures/$oldId/reprocess") {
 			auth("valid-a")
@@ -258,23 +263,25 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 			contentType = MediaType.APPLICATION_JSON
 			content = """{"text":"A colazione ho mangiato dei biscotti"}"""
 		}.andExpect {
-			status { isOk() }
-			jsonPath("$.outcome") { value("CLARIFICATION_REQUIRED") }
+			status { isCreated() }
+			jsonPath("$.outcome") { value("CAPTURE_REPLACED") }
+			jsonPath("$.interpretationOutcome") { value("UNRESOLVED") }
+			jsonPath("$.capture.payload.entries[0].text") { value("A colazione ho mangiato dei biscotti") }
 		}
 
-		assertEquals(DailyCaptureStatus.OPEN, captures.findById(DailyCaptureId(UUID.fromString(oldId)))?.status)
-		assertEquals(1, captures.count())
+		assertEquals(DailyCaptureStatus.REJECTED, captures.findById(DailyCaptureId(UUID.fromString(oldId)))?.status)
+		assertEquals(2, captures.count())
 	}
 
 	@Test
 	fun `accepted and foreign captures cannot be reprocessed`() {
-		interpreter.script(DailyAiScript.CreateCapture(validFoodProposal()))
+		interpreter.script(DailyAiScript.Interpret(validFoodProposal()))
 		val acceptedResponse = postMessage("2026-08-07", "original-accepted", "avena 40 g")
 		val acceptedId = captureId(acceptedResponse.andReturn().response.contentAsString)
 		val acceptedCaptureId = DailyCaptureId(UUID.fromString(acceptedId))
 		val accepted = requireNotNull(captures.findById(acceptedCaptureId)).accept(now.plusSeconds(1))
 		captures.save(accepted)
-		interpreter.reset(DailyAiScript.CreateCapture(validFoodProposal("biscotti")))
+		interpreter.reset(DailyAiScript.Interpret(validFoodProposal("biscotti")))
 
 		mockMvc.post("/api/daily/captures/$acceptedId/reprocess") {
 			auth("valid-a")
@@ -287,7 +294,7 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 
 		val foreignResponse = postMessage("2026-08-08", "original-foreign", "avena 40 g", "valid-a")
 		val foreignId = captureId(foreignResponse.andReturn().response.contentAsString)
-		interpreter.reset(DailyAiScript.CreateCapture(validFoodProposal("biscotti")))
+		interpreter.reset(DailyAiScript.Interpret(validFoodProposal("biscotti")))
 		mockMvc.post("/api/daily/captures/$foreignId/reprocess") {
 			auth("valid-b")
 			header("Idempotency-Key", "foreign-reprocess")
@@ -310,6 +317,29 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 				jsonPath("$.paths['/api/daily/days/{date}/messages'].post.parameters[1].name") {
 					value("Idempotency-Key")
 				}
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/messages'].post.requestBody.content['application/json']" +
+						".examples['Complete food message'].value.text",
+				) { value("Colazione: 40 g di avena e 100 g di mela") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/messages'].post.responses['201'].content['application/json']" +
+						".examples['Complete capture'].value.capture.payload.entries[0].items[0].sourceType",
+				) { value("USER_FOOD") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/messages'].post.responses['201'].content['application/json']" +
+						".examples['Complete capture'].value.capture.payload.entries[0].items[1].sourceType",
+				) { value("AI_ESTIMATE") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/messages'].post.responses['201'].content['application/json']" +
+						".examples['Partial capture'].value.interpretationOutcome",
+				) { value("PARTIAL") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/messages'].post.responses['201'].content['application/json']" +
+						".examples['Unresolved capture'].value.capture.payload.entries[0].type",
+				) { value("NOTE") }
+				jsonPath("$.paths['/api/daily/days/{date}/messages'].post.responses['502']") { exists() }
+				jsonPath("$.paths['/api/daily/days/{date}/messages'].post.responses['503']") { exists() }
+				jsonPath("$.paths['/api/daily/days/{date}/messages'].post.responses['504']") { exists() }
 			}
 	}
 
@@ -325,20 +355,24 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 		content = """{"text":"$text"}"""
 	}
 
-	private fun validFoodProposal(foodName: String = "avena") = AiCaptureProposal(
-		type = "FOOD",
+	private fun validFoodProposal(foodName: String = "avena") = DailyMessageInterpretation(
+		outcome = DailyMessageInterpretationOutcome.COMPLETE,
 		meals = listOf(
-			AiMealProposal(
+			AiMealInterpretation(
 				mealName = "colazione",
 				items = listOf(
-					AiFoodItemProposal(
-						foodName = foodName,
-						quantity = BigDecimal("40"),
-						unit = "g",
-						calories = BigDecimal("150"),
-						proteinG = BigDecimal("5"),
-						carbsG = BigDecimal("27"),
-						fatG = BigDecimal("3"),
+					AiFoodInterpretation(
+						originalFragment = foodName,
+						searchText = foodName,
+						statedQuantity = AiFoodQuantity(BigDecimal("40"), "g"),
+						estimatedQuantity = AiFoodQuantity(BigDecimal("40"), "g"),
+						nutritionEstimate = AiNutritionEstimate(
+							basis = AiFoodQuantity(BigDecimal("40"), "g"),
+							caloriesKcal = BigDecimal("150"),
+							proteinGrams = BigDecimal("5"),
+							carbohydratesGrams = BigDecimal("27"),
+							fatGrams = BigDecimal("3"),
+						),
 					),
 				),
 			),
@@ -398,6 +432,7 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 		@Bean fun authIdentities() = InMemoryUserAuthIdentityRepository()
 		@Bean fun dailyDays() = InMemoryDailyDayRepository()
 		@Bean fun dailyCaptures() = InMemoryDailyCaptureRepository()
+		@Bean fun dailyCaptureAudits() = InMemoryDailyCaptureAuditRepository()
 		@Bean fun dailyInboxEvents() = InMemoryDailyInboxEventRepository()
 		@Bean fun aiInterpretationLogs() = InMemoryAiInterpretationLogRepository()
 		@Bean fun clock(): Clock = Clock.fixed(Instant.parse("2026-07-30T08:00:00Z"), ZoneId.of("UTC"))
@@ -416,7 +451,7 @@ class DailyAiRestIntegrationTest @Autowired constructor(
 		)
 
 		@Bean
-		fun interpreter(terminalService: DailyAiTerminalService) = ScriptedDailyAiInterpreter(terminalService)
+		fun interpreter() = ScriptedDailyAiInterpreter()
 
 		@Bean
 		fun dailyAiCaptureProposalFactory() = DailyAiCaptureProposalFactory(

@@ -3,6 +3,8 @@ package com.fitlake.auth.infrastructure.firebase
 import com.fitlake.auth.application.AuthenticatedUser
 import com.fitlake.auth.infrastructure.FirebaseAuthenticationToken
 import com.fitlake.auth.infrastructure.RestAuthenticationEntryPoint
+import com.fitlake.shared.application.elapsedMilliseconds
+import com.fitlake.shared.logging.sanitizedForTechnicalLogging
 import com.fitlake.user.application.ProvisionUserCommand
 import com.fitlake.user.application.UserAccountNotFoundException
 import com.fitlake.user.application.UserProvisioningException
@@ -33,13 +35,17 @@ class FirebaseAuthenticationFilter(
 			return
 		}
 
+		val startedAtNanos = System.nanoTime()
 		val idToken = header.substring(BEARER_PREFIX.length).trim()
 		if (idToken.isEmpty() || idToken.any(Char::isWhitespace)) {
-			authLogger.warn(
-				"Firebase authentication rejected: method={}, path={}, reason=malformed_bearer_token",
-				request.method,
-				request.requestURI,
-			)
+			authLogger.atWarn()
+				.addKeyValue("event", "auth_token_verification_failed")
+				.addKeyValue("outcome", "rejected")
+				.addKeyValue("authProvider", AUTH_PROVIDER)
+				.addKeyValue("method", request.method)
+				.addKeyValue("errorCode", "MALFORMED_BEARER_TOKEN")
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.log("Firebase token verification rejected")
 			unauthorized(request, response)
 			return
 		}
@@ -66,42 +72,70 @@ class FirebaseAuthenticationFilter(
 				),
 			)
 			SecurityContextHolder.setContext(context)
-			authLogger.debug(
-				"Firebase authentication succeeded: method={}, path={}, issuer={}",
-				request.method,
-				request.requestURI,
-				claims.issuer,
-			)
-			filterChain.doFilter(request, response)
+			authLogger.atDebug()
+				.addKeyValue("event", "auth_user_resolved")
+				.addKeyValue("outcome", "success")
+				.addKeyValue("authProvider", AUTH_PROVIDER)
+				.addKeyValue("userRef", account.userId.value)
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.log("Authenticated user resolved")
 		} catch (exception: FirebaseTokenVerificationException) {
 			SecurityContextHolder.clearContext()
-			authLogger.debug(
-				"Firebase authentication rejected: method={}, path={}, reason=token_verification_failed",
-				request.method,
-				request.requestURI,
-			)
 			unauthorized(request, response)
+			return
 		} catch (exception: IllegalArgumentException) {
 			SecurityContextHolder.clearContext()
-			authLogger.warn(
-				"Firebase authentication rejected: method={}, path={}, reason=invalid_verified_claims",
-				request.method,
-				request.requestURI,
-			)
+			authLogger.atWarn()
+				.addKeyValue("event", "auth_user_resolution_failed")
+				.addKeyValue("outcome", "rejected")
+				.addKeyValue("authProvider", AUTH_PROVIDER)
+				.addKeyValue("errorCode", "INVALID_VERIFIED_CLAIMS")
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.log("Authenticated user resolution rejected")
 			unauthorized(request, response)
+			return
 		} catch (exception: UserAccountNotFoundException) {
 			SecurityContextHolder.clearContext()
-			authLogger.error(
-				"Firebase authentication failed after token verification: reason=missing_internal_user",
-			)
+			authLogger.atError()
+				.addKeyValue("event", "auth_user_resolution_failed")
+				.addKeyValue("outcome", "failure")
+				.addKeyValue("authProvider", AUTH_PROVIDER)
+				.addKeyValue("errorCode", "MISSING_INTERNAL_USER")
+				.addKeyValue("exceptionType", exception.javaClass.simpleName)
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.setCause(exception.sanitizedForTechnicalLogging())
+				.log("Authenticated user resolution failed")
 			internalServerError(response)
+			return
 		} catch (exception: UserProvisioningException) {
 			SecurityContextHolder.clearContext()
-			authLogger.error(
-				"Firebase authentication failed after token verification: reason=user_provisioning_failed",
-			)
+			authLogger.atError()
+				.addKeyValue("event", "auth_user_resolution_failed")
+				.addKeyValue("outcome", "failure")
+				.addKeyValue("authProvider", AUTH_PROVIDER)
+				.addKeyValue("errorCode", "USER_PROVISIONING_FAILED")
+				.addKeyValue("exceptionType", exception.javaClass.simpleName)
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.setCause(exception.sanitizedForTechnicalLogging())
+				.log("Authenticated user resolution failed")
 			internalServerError(response)
+			return
+		} catch (exception: RuntimeException) {
+			SecurityContextHolder.clearContext()
+			authLogger.atError()
+				.addKeyValue("event", "auth_user_resolution_failed")
+				.addKeyValue("outcome", "failure")
+				.addKeyValue("authProvider", AUTH_PROVIDER)
+				.addKeyValue("errorCode", "AUTHENTICATION_PROCESSING_FAILED")
+				.addKeyValue("exceptionType", exception.javaClass.simpleName)
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.setCause(exception.sanitizedForTechnicalLogging())
+				.log("Authenticated user resolution failed")
+			internalServerError(response)
+			return
 		}
+
+		filterChain.doFilter(request, response)
 	}
 
 	private fun unauthorized(request: HttpServletRequest, response: HttpServletResponse) {
@@ -126,6 +160,7 @@ class FirebaseAuthenticationFilter(
 	companion object {
 		private const val AUTHORIZATION_HEADER = "Authorization"
 		private const val BEARER_PREFIX = "Bearer "
+		private const val AUTH_PROVIDER = "firebase"
 		private val authLogger = LoggerFactory.getLogger(FirebaseAuthenticationFilter::class.java)
 	}
 }

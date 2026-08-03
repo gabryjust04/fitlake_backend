@@ -4,9 +4,12 @@ import com.fitlake.daily.application.capture.CaptureConfirmationService
 import com.fitlake.daily.application.capture.DailyCaptureService
 import com.fitlake.daily.application.finalization.DailyFinalizationService
 import com.fitlake.daily.application.finalization.DailyMetricsProjectionService
+import com.fitlake.daily.domain.audit.DailyCaptureAuditAction
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.daily.domain.capture.DailyFoodQuantityUnit
+import com.fitlake.daily.infrastructure.persistence.mapper.DailyCaptureAuditPersistenceMapper
 import com.fitlake.daily.infrastructure.persistence.mapper.DailyPersistenceMapper
+import com.fitlake.daily.infrastructure.persistence.repository.JpaDailyCaptureAuditRepository
 import com.fitlake.daily.infrastructure.persistence.repository.JpaDailyCaptureRepository
 import com.fitlake.daily.infrastructure.persistence.repository.JpaDailyDayRepository
 import com.fitlake.daily.infrastructure.persistence.repository.JpaDailyMetricsRepository
@@ -52,8 +55,10 @@ import kotlin.test.assertEquals
 @Import(
 	JacksonAutoConfiguration::class,
 	DailyPersistenceMapper::class,
+	DailyCaptureAuditPersistenceMapper::class,
 	JpaDailyDayRepository::class,
 	JpaDailyCaptureRepository::class,
+	JpaDailyCaptureAuditRepository::class,
 	JpaDailyMetricsRepository::class,
 	UserPersistenceMapper::class,
 	JpaUserAccountRepositoryAdapter::class,
@@ -61,6 +66,7 @@ import kotlin.test.assertEquals
 class DailyPersistenceIntegrationTest @Autowired constructor(
 	private val days: JpaDailyDayRepository,
 	private val captures: JpaDailyCaptureRepository,
+	private val audits: JpaDailyCaptureAuditRepository,
 	private val metrics: JpaDailyMetricsRepository,
 	private val users: JpaUserAccountRepositoryAdapter,
 	private val jdbcTemplate: JdbcTemplate,
@@ -74,6 +80,7 @@ class DailyPersistenceIntegrationTest @Autowired constructor(
 	private val confirmationService = CaptureConfirmationService(
 		days,
 		captures,
+		audits,
 		captureService,
 		transactions,
 		clock,
@@ -141,6 +148,14 @@ class DailyPersistenceIntegrationTest @Autowired constructor(
 		assertEquals(BigDecimal("78.4"), persisted.bodyWeightKg)
 		assertEquals(2, persisted.generatedFromCaptureIds.size)
 		assertEquals(DailyCaptureStatus.ACCEPTED, captures.findById(food.captureId)?.status)
+		assertEquals(
+			DailyCaptureAuditAction.ACCEPT,
+			audits.findAllByCaptureIdAndUserId(food.captureId, userId).single().action,
+		)
+		assertEquals(
+			DailyCaptureAuditAction.ACCEPT,
+			audits.findAllByCaptureIdAndUserId(fields.captureId, userId).single().action,
+		)
 		assertEquals(
 			"array",
 			jdbcTemplate.queryForObject(

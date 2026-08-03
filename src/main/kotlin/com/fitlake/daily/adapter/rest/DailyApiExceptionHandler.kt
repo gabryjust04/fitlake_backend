@@ -12,9 +12,16 @@ import com.fitlake.daily.application.ai.DailyAiInvalidOutputException
 import com.fitlake.daily.application.ai.DailyAiOperationInProgressException
 import com.fitlake.daily.application.ai.DailyAiPersistenceException
 import com.fitlake.daily.application.ai.DailyAiProviderUnavailableException
+import com.fitlake.daily.application.ai.DailyAiProviderAuthenticationException
+import com.fitlake.daily.application.ai.DailyAiProviderQuotaException
+import com.fitlake.daily.application.ai.DailyAiRateLimitException
 import com.fitlake.daily.application.ai.DailyAiRecordedFailureException
 import com.fitlake.daily.application.ai.DailyAiTimeoutException
+import com.fitlake.shared.logging.sanitizedForTechnicalLogging
 import jakarta.validation.ConstraintViolationException
+import org.slf4j.LoggerFactory
+import org.springframework.core.Ordered
+import org.springframework.core.annotation.Order
 import org.springframework.dao.OptimisticLockingFailureException
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
@@ -32,7 +39,8 @@ data class DailyApiError(
 	val fieldErrors: Map<String, String> = emptyMap(),
 )
 
-@RestControllerAdvice
+@Order(Ordered.HIGHEST_PRECEDENCE)
+@RestControllerAdvice(assignableTypes = [DailyController::class, DailyAiController::class])
 class DailyApiExceptionHandler {
 	@ExceptionHandler(DailyNotFoundException::class)
 	fun notFound(exception: DailyNotFoundException): ResponseEntity<DailyApiError> =
@@ -43,8 +51,13 @@ class DailyApiExceptionHandler {
 		DailyConcurrentCreationException::class,
 		OptimisticLockingFailureException::class,
 	)
-	fun conflict(exception: RuntimeException): ResponseEntity<DailyApiError> =
-		response(HttpStatus.CONFLICT, "conflict", exception.message ?: "Daily state conflict")
+	fun conflict(exception: RuntimeException): ResponseEntity<DailyApiError> {
+		val safeMessage = when (exception) {
+			is OptimisticLockingFailureException -> "Daily state conflict"
+			else -> exception.message ?: "Daily state conflict"
+		}
+		return response(HttpStatus.CONFLICT, "conflict", safeMessage)
+	}
 
 	@ExceptionHandler(DailyValidationException::class)
 	fun validation(exception: DailyValidationException): ResponseEntity<DailyApiError> =
@@ -63,10 +76,16 @@ class DailyApiExceptionHandler {
 
 	@ExceptionHandler(
 		DailyAiConfigurationException::class,
+		DailyAiProviderAuthenticationException::class,
+		DailyAiProviderQuotaException::class,
 		DailyAiProviderUnavailableException::class,
 	)
 	fun aiUnavailable(exception: DailyAiException): ResponseEntity<DailyApiError> =
 		response(HttpStatus.SERVICE_UNAVAILABLE, exception.errorCode.lowercase(), exception.safeMessage)
+
+	@ExceptionHandler(DailyAiRateLimitException::class)
+	fun aiRateLimited(exception: DailyAiRateLimitException): ResponseEntity<DailyApiError> =
+		response(HttpStatus.TOO_MANY_REQUESTS, exception.errorCode.lowercase(), exception.safeMessage)
 
 	@ExceptionHandler(DailyAiTimeoutException::class)
 	fun aiTimeout(exception: DailyAiTimeoutException): ResponseEntity<DailyApiError> =
@@ -103,9 +122,35 @@ class DailyApiExceptionHandler {
 		response(HttpStatus.BAD_REQUEST, "invalid_request", "Request parameters are missing or invalid")
 
 	@ExceptionHandler(DailyStateCorruptionException::class)
-	fun corruptedState(): ResponseEntity<DailyApiError> =
-		response(HttpStatus.INTERNAL_SERVER_ERROR, "internal_server_error", "Daily state is inconsistent")
+	fun corruptedState(exception: DailyStateCorruptionException): ResponseEntity<DailyApiError> {
+		logFailure(
+			event = "daily_state_corruption_detected",
+			errorCode = "DAILY_STATE_CORRUPTION",
+			exception = exception,
+			message = "Daily state corruption detected",
+		)
+		return response(HttpStatus.INTERNAL_SERVER_ERROR, "internal_server_error", "Daily state is inconsistent")
+	}
+
+	private fun logFailure(
+		event: String,
+		errorCode: String,
+		exception: RuntimeException,
+		message: String,
+	) {
+		logger.atError()
+			.addKeyValue("event", event)
+			.addKeyValue("outcome", "failure")
+			.addKeyValue("errorCode", errorCode)
+			.addKeyValue("exceptionType", exception.javaClass.name)
+			.setCause(exception.sanitizedForTechnicalLogging())
+			.log(message)
+	}
 
 	private fun response(status: HttpStatus, error: String, message: String): ResponseEntity<DailyApiError> =
 		ResponseEntity.status(status).body(DailyApiError(error, message))
+
+	private companion object {
+		val logger = LoggerFactory.getLogger(DailyApiExceptionHandler::class.java)
+	}
 }

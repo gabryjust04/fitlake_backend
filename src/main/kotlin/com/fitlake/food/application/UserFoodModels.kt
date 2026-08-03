@@ -151,6 +151,10 @@ data class UserFoodSearchQuery(
 
 interface SearchUserFoodsUseCase {
 	fun search(userId: UserId, query: String, limit: Int = 10): List<UserFoodCandidate>
+
+	/** Internal AI lookup variant; implementations may lower technical-log verbosity. */
+	fun searchForDailyAi(userId: UserId, query: String, limit: Int): List<UserFoodCandidate> =
+		search(userId, query, limit)
 }
 
 internal fun normalizeSearchQuery(query: String): String = UserFoodTextNormalizer.normalize(query)

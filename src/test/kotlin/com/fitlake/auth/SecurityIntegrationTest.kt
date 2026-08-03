@@ -20,7 +20,9 @@ import org.springframework.boot.SpringBootConfiguration
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration
 import org.springframework.boot.test.context.SpringBootTest
 import org.springframework.boot.test.context.TestConfiguration
+import org.springframework.boot.web.servlet.FilterRegistrationBean
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc
+import org.springframework.context.ApplicationContext
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Import
 import org.springframework.beans.factory.annotation.Autowired
@@ -29,6 +31,7 @@ import org.springframework.test.web.servlet.get
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
+import kotlin.test.assertFalse
 
 @SpringBootTest(
 	classes = [SecurityIntegrationTest.TestApplication::class],
@@ -42,12 +45,31 @@ import java.time.ZoneId
 @AutoConfigureMockMvc
 class SecurityIntegrationTest @Autowired constructor(
 	private val mockMvc: MockMvc,
+	private val applicationContext: ApplicationContext,
 ) {
+	@Test
+	fun `Firebase filter servlet auto registration is disabled`() {
+		val registration = applicationContext.getBean(
+			"firebaseAuthenticationFilterServletRegistration",
+			FilterRegistrationBean::class.java,
+		)
+
+		assertFalse(registration.isEnabled)
+	}
+
 	@Test
 	fun `health endpoint is public`() {
 		mockMvc.get("/actuator/health")
 			.andExpect {
 				status { isOk() }
+			}
+	}
+
+	@Test
+	fun `actuator loggers endpoint is not public`() {
+		mockMvc.get("/actuator/loggers")
+			.andExpect {
+				status { is4xxClientError() }
 			}
 	}
 

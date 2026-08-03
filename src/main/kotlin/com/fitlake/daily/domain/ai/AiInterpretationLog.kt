@@ -14,8 +14,7 @@ enum class AiInterpretationStatus {
 	SUCCESS,
 	FAILED,
 	INVALID_OUTPUT,
-	NEEDS_CLARIFICATION,
-	NO_OP,
+	NO_RELEVANT_DATA,
 }
 
 data class AiInterpretationLog(
@@ -26,7 +25,7 @@ data class AiInterpretationLog(
 	val provider: String,
 	val model: String,
 	val promptVersion: String,
-	val inputText: String,
+	val inputText: String?,
 	val contextSnapshot: Map<String, Any?>,
 	val parsedOutput: Map<String, Any?>,
 	val status: AiInterpretationStatus,
@@ -40,7 +39,7 @@ data class AiInterpretationLog(
 		require(provider.isNotBlank()) { "AI provider must not be blank" }
 		require(model.isNotBlank()) { "AI model must not be blank" }
 		require(promptVersion.isNotBlank()) { "AI prompt version must not be blank" }
-		require(inputText.isNotBlank()) { "AI input text must not be blank" }
+		require(inputText == null || inputText.isNotBlank()) { "AI input text must be null or non-blank" }
 		require(confidence == null || confidence in BigDecimal.ZERO..BigDecimal.ONE) {
 			"AI confidence must be between 0 and 1"
 		}

@@ -1,39 +1,33 @@
 package com.fitlake.support
 
-import com.fitlake.daily.application.ai.AiCaptureProposal
-import com.fitlake.daily.application.ai.AiClarificationProposal
-import com.fitlake.daily.application.ai.AiNoOpProposal
-import com.fitlake.daily.application.ai.DailyAiInterpreter
+import com.fitlake.daily.application.ai.CaptureInterpreterPort
 import com.fitlake.daily.application.ai.DailyAiProviderMetadata
-import com.fitlake.daily.application.ai.DailyAiRequestContext
-import com.fitlake.daily.application.ai.DailyAiResult
-import com.fitlake.daily.application.ai.DailyAiTerminalService
+import com.fitlake.daily.application.ai.DailyMessageInterpretation
+import com.fitlake.daily.application.ai.DailyMessageInterpretationOutcome
+import com.fitlake.daily.application.ai.InterpretDailyMessageRequest
+import com.fitlake.daily.application.ai.InterpretedDailyMessage
 import java.util.concurrent.CopyOnWriteArrayList
 
 sealed interface DailyAiScript {
-	data class CreateCapture(val proposal: AiCaptureProposal) : DailyAiScript
-	data class AskClarification(val question: String?) : DailyAiScript
-	data class NoOp(val reason: String?) : DailyAiScript
+	data class Interpret(val interpretation: DailyMessageInterpretation, val retryCount: Int = 0) : DailyAiScript
+	data object Unresolved : DailyAiScript
+	data object NoRelevantData : DailyAiScript
 	data class Fail(val exception: RuntimeException) : DailyAiScript
 }
 
-data class ObservedDailyAiRequest(
-	val context: DailyAiRequestContext,
-	val text: String,
-)
+data class ObservedDailyAiRequest(val request: InterpretDailyMessageRequest)
 
 class ScriptedDailyAiInterpreter(
-	private val terminalService: DailyAiTerminalService,
 	override val metadata: DailyAiProviderMetadata = DailyAiProviderMetadata(
 		provider = "test-provider",
 		model = "test-model",
-		promptVersion = "test-prompt-v1",
+		promptVersion = "test-prompt-v3",
 	),
-) : DailyAiInterpreter {
+) : CaptureInterpreterPort {
 	private val observedRequests = CopyOnWriteArrayList<ObservedDailyAiRequest>()
 
 	@Volatile
-	private var nextScript: DailyAiScript = DailyAiScript.NoOp("No Daily data")
+	private var nextScript: DailyAiScript = DailyAiScript.NoRelevantData
 
 	val requests: List<ObservedDailyAiRequest>
 		get() = observedRequests.toList()
@@ -45,21 +39,38 @@ class ScriptedDailyAiInterpreter(
 		nextScript = script
 	}
 
-	fun reset(script: DailyAiScript = DailyAiScript.NoOp("No Daily data")) {
+	fun reset(script: DailyAiScript = DailyAiScript.NoRelevantData) {
 		observedRequests.clear()
 		nextScript = script
 	}
 
-	override fun interpret(context: DailyAiRequestContext, text: String): DailyAiResult {
-		observedRequests += ObservedDailyAiRequest(context, text)
+	override fun interpret(request: InterpretDailyMessageRequest): InterpretedDailyMessage {
+		observedRequests += ObservedDailyAiRequest(request)
 		return when (val selected = nextScript) {
-			is DailyAiScript.CreateCapture -> terminalService.createCapture(context, selected.proposal)
-			is DailyAiScript.AskClarification -> terminalService.askClarification(
-				context,
-				AiClarificationProposal(selected.question),
+			is DailyAiScript.Interpret -> InterpretedDailyMessage(
+				selected.interpretation.withExactTestFragments(request.text),
+				selected.retryCount,
 			)
-			is DailyAiScript.NoOp -> terminalService.noOp(context, AiNoOpProposal(selected.reason))
+			DailyAiScript.Unresolved -> InterpretedDailyMessage(
+				DailyMessageInterpretation(DailyMessageInterpretationOutcome.UNRESOLVED),
+			)
+			DailyAiScript.NoRelevantData -> InterpretedDailyMessage(
+				DailyMessageInterpretation(DailyMessageInterpretationOutcome.NO_RELEVANT_DATA),
+			)
 			is DailyAiScript.Fail -> throw selected.exception
 		}
 	}
+
+	private fun DailyMessageInterpretation.withExactTestFragments(rawText: String): DailyMessageInterpretation = copy(
+		meals = meals.map { meal ->
+			meal.copy(
+				items = meal.items.map { food ->
+					food.copy(originalFragment = food.originalFragment.takeIf(rawText::contains) ?: rawText)
+				},
+			)
+		},
+		fields = fields.map { field ->
+			field.copy(originalFragment = field.originalFragment.takeIf(rawText::contains) ?: rawText)
+		},
+	)
 }

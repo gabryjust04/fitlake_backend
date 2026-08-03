@@ -1,5 +1,6 @@
 package com.fitlake.auth.infrastructure.firebase
 
+import com.fitlake.shared.application.elapsedMilliseconds
 import com.google.auth.oauth2.GoogleCredentials
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
@@ -15,46 +16,65 @@ class FirebaseAdminConfig {
 
 	@Bean
 	fun firebaseApp(properties: FirebaseProperties): FirebaseApp {
+		val startedAtNanos = System.nanoTime()
 		FirebaseApp.getApps()
 			.firstOrNull { it.name == FirebaseApp.DEFAULT_APP_NAME }
 			?.let {
-				logger.info(
-					"Reusing Firebase Admin app: appName={}, configuredProjectId={}",
-					it.name,
-					properties.projectId,
-				)
+				logger.atInfo()
+					.addKeyValue("event", "firebase_admin_initialized")
+					.addKeyValue("outcome", "success")
+					.addKeyValue("mode", "reused")
+					.addKeyValue("appName", it.name)
+					.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+					.log("Firebase Admin initialized")
 				return it
 			}
 
 		val credentials = try {
 			GoogleCredentials.getApplicationDefault()
 		} catch (exception: Exception) {
-			logger.error(
-				"Firebase Application Default Credentials could not be loaded; " +
-					"check GOOGLE_APPLICATION_CREDENTIALS (exceptionType={})",
-				exception.javaClass.simpleName,
-			)
-			throw exception
-		}
-
-		logger.info(
-			"Firebase Application Default Credentials loaded: credentialType={}, configuredProjectId={}",
-			credentials.javaClass.simpleName,
-			properties.projectId,
-		)
-
-		val options = FirebaseOptions.builder()
-			.setCredentials(credentials)
-			.setProjectId(properties.projectId)
-			.build()
-
-		return FirebaseApp.initializeApp(options).also {
-			logger.info(
-				"Firebase Admin initialized: appName={}, projectId={}",
-				it.name,
-				properties.projectId,
+			initializationFailure(
+				"APPLICATION_DEFAULT_CREDENTIALS_UNAVAILABLE",
+				exception,
+				startedAtNanos,
 			)
 		}
+
+		val initialized = try {
+			val options = FirebaseOptions.builder()
+				.setCredentials(credentials)
+				.setProjectId(properties.projectId)
+				.build()
+			FirebaseApp.initializeApp(options)
+		} catch (exception: Exception) {
+			initializationFailure("FIREBASE_ADMIN_INITIALIZATION_FAILED", exception, startedAtNanos)
+		}
+
+		return initialized.also {
+			logger.atInfo()
+				.addKeyValue("event", "firebase_admin_initialized")
+				.addKeyValue("outcome", "success")
+				.addKeyValue("mode", "created")
+				.addKeyValue("appName", it.name)
+				.addKeyValue("credentialType", credentials.javaClass.simpleName)
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.log("Firebase Admin initialized")
+		}
+	}
+
+	internal fun initializationFailure(
+		errorCode: String,
+		exception: Exception,
+		startedAtNanos: Long,
+	): Nothing {
+		logger.atError()
+			.addKeyValue("event", "firebase_admin_initialization_failed")
+			.addKeyValue("outcome", "failure")
+			.addKeyValue("errorCode", errorCode)
+			.addKeyValue("exceptionType", exception.javaClass.simpleName)
+			.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+			.log("Firebase Admin initialization failed")
+		throw FirebaseAdminInitializationException(errorCode, exception.stackTrace)
 	}
 
 	@Bean
@@ -66,5 +86,14 @@ class FirebaseAdminConfig {
 
 	companion object {
 		private val logger = LoggerFactory.getLogger(FirebaseAdminConfig::class.java)
+	}
+}
+
+internal class FirebaseAdminInitializationException(
+	errorCode: String,
+	originalStackTrace: Array<StackTraceElement>,
+) : IllegalStateException("Firebase Admin initialization failed ($errorCode)") {
+	init {
+		stackTrace = originalStackTrace
 	}
 }

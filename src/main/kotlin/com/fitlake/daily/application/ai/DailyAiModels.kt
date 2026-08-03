@@ -26,8 +26,107 @@ data class DailyAiRequestContext(
 	val processingAttemptId: UUID,
 )
 
+data class InterpretDailyMessageRequest(
+	val targetDate: LocalDate,
+	val timezone: ZoneId,
+	val text: String,
+)
+
+data class InterpretedDailyMessage(
+	val interpretation: DailyMessageInterpretation,
+	val retryCount: Int = 0,
+	val inputTokens: Long? = null,
+	val outputTokens: Long? = null,
+) {
+	init {
+		require(retryCount >= 0) { "AI retry count must not be negative" }
+		require(inputTokens == null || inputTokens >= 0) { "AI input token count must not be negative" }
+		require(outputTokens == null || outputTokens >= 0) { "AI output token count must not be negative" }
+	}
+}
+
+fun interface CaptureInterpreterPort {
+	fun interpret(request: InterpretDailyMessageRequest): InterpretedDailyMessage
+
+	val metadata: DailyAiProviderMetadata
+		get() = DailyAiProviderMetadata("UNKNOWN", "unknown", "unknown")
+}
+
+enum class DailyMessageInterpretationOutcome {
+	COMPLETE,
+	PARTIAL,
+	UNRESOLVED,
+	NO_RELEVANT_DATA,
+}
+
+data class DailyMessageInterpretation(
+	val outcome: DailyMessageInterpretationOutcome,
+	val meals: List<AiMealInterpretation> = emptyList(),
+	val fields: List<AiDailyFieldInterpretation> = emptyList(),
+	val unresolvedFragments: List<String> = emptyList(),
+	val confidence: BigDecimal? = null,
+)
+
+data class AiMealInterpretation(
+	val mealName: String? = null,
+	val items: List<AiFoodInterpretation> = emptyList(),
+)
+
+data class AiFoodInterpretation(
+	val originalFragment: String,
+	val searchText: String,
+	val statedQuantity: AiFoodQuantity? = null,
+	val estimatedQuantity: AiFoodQuantity,
+	val nutritionEstimate: AiNutritionEstimate,
+	val assumptions: List<String> = emptyList(),
+)
+
+data class AiFoodQuantity(
+	val amount: BigDecimal,
+	val unit: String,
+)
+
+data class AiNutritionEstimate(
+	val basis: AiFoodQuantity,
+	val caloriesKcal: BigDecimal,
+	val proteinGrams: BigDecimal,
+	val carbohydratesGrams: BigDecimal,
+	val fatGrams: BigDecimal,
+	val fiberGrams: BigDecimal? = null,
+	val sugarsGrams: BigDecimal? = null,
+	val saturatedFatGrams: BigDecimal? = null,
+	val sodiumMilligrams: BigDecimal? = null,
+	val saltGrams: BigDecimal? = null,
+)
+
+enum class AiDailyFieldType {
+	BODY_WEIGHT_KG,
+	SLEEP_HOURS,
+	STEPS_COUNT,
+	HYDRATION_LITERS,
+	CAFFEINE_MG,
+	MOOD_LEVEL,
+	FOCUS_LEVEL,
+	STRESS_LEVEL,
+	DAILY_NOTES,
+}
+
+data class AiDailyFieldInterpretation(
+	val field: AiDailyFieldType,
+	val numericValue: BigDecimal? = null,
+	val textValue: String? = null,
+	val originalFragment: String,
+)
+
 sealed interface DailyAiPreparation {
-	data class Execute(val context: DailyAiRequestContext) : DailyAiPreparation
+	data class Execute(
+		val context: DailyAiRequestContext,
+		val persistedRawText: String,
+	) : DailyAiPreparation {
+		init {
+			require(persistedRawText.isNotBlank()) { "Persisted Daily AI input must not be blank" }
+		}
+	}
 	data class Replay(val result: DailyAiResult) : DailyAiPreparation
 }
 
@@ -38,64 +137,11 @@ sealed interface DailyAiResult {
 		override val date: LocalDate,
 		val capture: DailyAiCaptureResult,
 		val replacedCaptureId: DailyCaptureId?,
+		val interpretationOutcome: DailyMessageInterpretationOutcome,
 	) : DailyAiResult
 
-	data class ClarificationRequired(
+	data class NoRelevantData(
 		override val date: LocalDate,
-		val question: String,
-	) : DailyAiResult
-
-	data class NoOp(
-		override val date: LocalDate,
-		val reason: String,
+		val reason: String = "The message contains no relevant Daily data",
 	) : DailyAiResult
 }
-
-interface DailyAiInterpreter {
-	val metadata: DailyAiProviderMetadata
-
-	fun interpret(context: DailyAiRequestContext, text: String): DailyAiResult
-}
-
-data class AiCaptureProposal(
-	val type: String? = null,
-	val meals: List<AiMealProposal> = emptyList(),
-	val fields: AiDailyFieldsProposal = AiDailyFieldsProposal(),
-	val note: String? = null,
-	val confidence: BigDecimal? = null,
-)
-
-data class AiMealProposal(
-	val mealName: String? = null,
-	val items: List<AiFoodItemProposal> = emptyList(),
-)
-
-data class AiFoodItemProposal(
-	val foodName: String? = null,
-	val quantity: BigDecimal? = null,
-	val unit: String? = null,
-	val calories: BigDecimal,
-	val proteinG: BigDecimal,
-	val carbsG: BigDecimal,
-	val fatG: BigDecimal,
-)
-
-data class AiDailyFieldsProposal(
-	val bodyWeightKg: BigDecimal? = null,
-	val sleepHours: BigDecimal? = null,
-	val stepsCount: Int? = null,
-	val hydrationLiters: BigDecimal? = null,
-	val caffeineMg: Int? = null,
-	val moodLevel: Int? = null,
-	val focusLevel: Int? = null,
-	val stressLevel: Int? = null,
-	val dailyNotes: String? = null,
-)
-
-data class AiClarificationProposal(
-	val question: String? = null,
-)
-
-data class AiNoOpProposal(
-	val reason: String? = null,
-)

@@ -1,15 +1,18 @@
 package com.fitlake.user.application
 
 import com.fitlake.shared.application.TransactionExecutor
+import com.fitlake.shared.application.elapsedMilliseconds
 import com.fitlake.user.application.port.UserAccountRepository
 import com.fitlake.user.application.port.UserAuthIdentityRepository
 import com.fitlake.user.domain.UserAccount
 import com.fitlake.user.domain.UserAuthIdentity
 import com.fitlake.user.domain.UserId
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
+import java.util.Locale
 import java.util.UUID
 
 @Service
@@ -21,22 +24,36 @@ class UserProvisioningService(
 	private val defaultUserTimezone: ZoneId,
 ) {
 	fun provision(command: ProvisionUserCommand): UserAccount {
+		val startedAtNanos = System.nanoTime()
 		validate(command)
 
-		return try {
+		val result = try {
 			transactionExecutor.required { resolveOrCreate(command) }
 		} catch (conflict: AuthIdentityConflictException) {
 			transactionExecutor.required {
-				resolveExisting(command) ?: throw UserProvisioningException(
-					"Authentication identity conflict could not be resolved",
-					conflict,
+				ProvisioningResult(
+					account = resolveExisting(command) ?: throw UserProvisioningException(
+						"Authentication identity conflict could not be resolved",
+						conflict,
+					),
+					created = false,
 				)
 			}
 		}
+		if (result.created) {
+			logger.atInfo()
+				.addKeyValue("event", "user_account_provisioned")
+				.addKeyValue("outcome", "success")
+				.addKeyValue("authProvider", command.provider.name.lowercase(Locale.ROOT))
+				.addKeyValue("userRef", result.account.userId.value)
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.log("Internal user account provisioned")
+		}
+		return result.account
 	}
 
-	private fun resolveOrCreate(command: ProvisionUserCommand): UserAccount {
-		resolveExisting(command)?.let { return it }
+	private fun resolveOrCreate(command: ProvisionUserCommand): ProvisioningResult {
+		resolveExisting(command)?.let { return ProvisioningResult(it, created = false) }
 
 		val now = clock.instant()
 		val userAccount = userAccountRepository.save(
@@ -63,7 +80,7 @@ class UserProvisioningService(
 			),
 		)
 
-		return userAccount
+		return ProvisioningResult(userAccount, created = true)
 	}
 
 	private fun resolveExisting(command: ProvisionUserCommand): UserAccount? {
@@ -105,4 +122,13 @@ class UserProvisioningService(
 	}
 
 	private fun String?.normalizedOrNull(): String? = this?.trim()?.takeIf(String::isNotEmpty)
+
+	private data class ProvisioningResult(
+		val account: UserAccount,
+		val created: Boolean,
+	)
+
+	private companion object {
+		val logger = LoggerFactory.getLogger(UserProvisioningService::class.java)
+	}
 }

@@ -38,8 +38,8 @@ class AiInterpretationLogEntity(
 	@Column(name = "prompt_version", nullable = false, length = 100, updatable = false)
 	var promptVersion: String,
 
-	@Column(name = "input_text", nullable = false, columnDefinition = "text", updatable = false)
-	var inputText: String,
+	@Column(name = "input_text", columnDefinition = "text", updatable = false)
+	var inputText: String?,
 
 	@JdbcTypeCode(SqlTypes.JSON)
 	@Column(name = "context_snapshot", columnDefinition = "jsonb", updatable = false)

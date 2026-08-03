@@ -1,73 +1,73 @@
 package com.fitlake.daily.infrastructure.food
 
+import com.fitlake.daily.application.ai.DailyAiFoodCandidateDecision
+import com.fitlake.daily.application.ai.DailyAiFoodMatchPolicy
+import com.fitlake.daily.application.port.DailyAiFoodCandidate
+import com.fitlake.daily.application.port.DailyAiFoodMatchType
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchPort
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchResult
-import com.fitlake.food.application.port.UserFoodRepository
-import com.fitlake.food.domain.UserFoodId
-import com.fitlake.food.domain.UserFoodTextNormalizer
-import com.fitlake.shared.application.TransactionExecutor
+import com.fitlake.daily.application.port.DailyUserFoodLookupPort
+import com.fitlake.food.application.SearchUserFoodsUseCase
+import com.fitlake.food.application.UserFoodCandidate
+import com.fitlake.food.application.UserFoodMatchType
+import com.fitlake.food.application.UserFoodValidationException
 import com.fitlake.user.domain.UserId
-import org.springframework.jdbc.core.namedparam.MapSqlParameterSource
-import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate
 import org.springframework.stereotype.Component
-import java.util.UUID
 
+/** Reuses the same ranked PostgreSQL search used by the UI, then applies a stricter AI policy. */
 @Component
 class PostgresDailyAiUserFoodMatchAdapter(
-	private val jdbcTemplate: NamedParameterJdbcTemplate,
-	private val repository: UserFoodRepository,
-	private val transactionExecutor: TransactionExecutor,
+	private val searchUserFoods: SearchUserFoodsUseCase,
+	private val lookupPort: DailyUserFoodLookupPort,
+	private val matchPolicy: DailyAiFoodMatchPolicy,
 ) : DailyAiUserFoodMatchPort {
-	override fun match(userId: UserId, extractedName: String): DailyAiUserFoodMatchResult {
-		val normalizedName = UserFoodTextNormalizer.normalize(extractedName)
-		if (normalizedName.isEmpty()) return DailyAiUserFoodMatchResult.None
-
-		return transactionExecutor.required {
-			val matchingIds = jdbcTemplate.query(
-				EXACT_MATCH_SQL,
-				MapSqlParameterSource()
-					.addValue("userId", userId.value)
-					.addValue("normalizedName", normalizedName),
-			) { resultSet, _ ->
-				requireNotNull(resultSet.getObject("user_food_id", UUID::class.java))
-			}
-			when (matchingIds.size) {
-				0 -> DailyAiUserFoodMatchResult.None
-				1 -> repository.findActiveByIdAndUserId(UserFoodId(matchingIds.single()), userId)
-					?.takeIf { food ->
-						food.normalizedName == normalizedName ||
-							food.aliases.any { alias -> alias.normalizedValue == normalizedName }
-					}
-					?.let { food -> DailyAiUserFoodMatchResult.Unique(food.toDailyOwnedUserFood()) }
-					?: DailyAiUserFoodMatchResult.None
-				else -> DailyAiUserFoodMatchResult.Ambiguous
+	override fun match(userId: UserId, searchText: String): DailyAiUserFoodMatchResult {
+		val catalogCandidates = try {
+			searchUserFoods.searchForDailyAi(userId, searchText, SEARCH_LIMIT)
+		} catch (_: UserFoodValidationException) {
+			return DailyAiUserFoodMatchResult.None
+		}
+		val candidates = catalogCandidates.map { it.toDailyCandidate() }
+		return when (
+			val decision = matchPolicy.decide(
+				candidates = candidates,
+				candidateWindowComplete = catalogCandidates.size < SEARCH_LIMIT,
+			)
+		) {
+			DailyAiFoodCandidateDecision.None -> DailyAiUserFoodMatchResult.None
+			is DailyAiFoodCandidateDecision.Ambiguous -> DailyAiUserFoodMatchResult.Ambiguous(
+				reason = decision.reason,
+				bestMatchedBy = decision.bestMatchedBy,
+				bestScore = decision.bestScore,
+				runnerUpScore = decision.runnerUpScore,
+				candidateCount = decision.candidateCount,
+			)
+			is DailyAiFoodCandidateDecision.Accept -> {
+				val candidate = decision.candidate
+				val food = lookupPort.findActiveOwnedFood(userId, candidate.foodId)
+					?: return DailyAiUserFoodMatchResult.None
+				DailyAiUserFoodMatchResult.Unique(food, candidate.matchedBy, candidate.score)
 			}
 		}
 	}
 
+	private fun UserFoodCandidate.toDailyCandidate() = DailyAiFoodCandidate(
+		foodId = foodId.value,
+		matchedBy = matchedBy.toDailyMatchType(),
+		score = score,
+	)
+
+	private fun UserFoodMatchType.toDailyMatchType(): DailyAiFoodMatchType = when (this) {
+		UserFoodMatchType.EXACT_BARCODE -> DailyAiFoodMatchType.EXACT_BARCODE
+		UserFoodMatchType.EXACT_ALIAS -> DailyAiFoodMatchType.EXACT_ALIAS
+		UserFoodMatchType.EXACT_NAME -> DailyAiFoodMatchType.EXACT_NAME
+		UserFoodMatchType.PREFIX_ALIAS -> DailyAiFoodMatchType.PREFIX_ALIAS
+		UserFoodMatchType.PREFIX_NAME -> DailyAiFoodMatchType.PREFIX_NAME
+		UserFoodMatchType.FUZZY_ALIAS -> DailyAiFoodMatchType.FUZZY_ALIAS
+		UserFoodMatchType.FUZZY_NAME -> DailyAiFoodMatchType.FUZZY_NAME
+	}
+
 	private companion object {
-		val EXACT_MATCH_SQL = """
-			WITH exact_food_ids AS (
-			    SELECT f.user_food_id
-			    FROM user_food f
-			    WHERE f.user_id = :userId
-			      AND f.deleted_at IS NULL
-			      AND f.normalized_name = :normalizedName
-			    UNION
-			    SELECT a.user_food_id
-			    FROM user_food_alias a
-			    JOIN user_food f
-			      ON f.user_food_id = a.user_food_id
-			     AND f.user_id = a.user_id
-			    WHERE a.user_id = :userId
-			      AND a.deleted_at IS NULL
-			      AND f.deleted_at IS NULL
-			      AND a.normalized_alias = :normalizedName
-			)
-			SELECT user_food_id
-			FROM exact_food_ids
-			ORDER BY user_food_id
-			LIMIT 2
-		""".trimIndent()
+		const val SEARCH_LIMIT = 50
 	}
 }

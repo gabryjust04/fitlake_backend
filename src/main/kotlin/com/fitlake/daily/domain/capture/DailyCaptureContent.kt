@@ -338,12 +338,13 @@ internal fun projectDailyCaptureEntries(entries: List<DailyCaptureEntry>): Daily
 	}
 	val itemIds = entries.flatMap(DailyCaptureEntry::items).map(DailyFoodCaptureItem::itemId)
 	require(itemIds.distinct().size == itemIds.size) { "Food item IDs must be unique within a capture" }
-	val nonRepeatable = entries.filter { it.type != DailyCaptureEntryType.FOOD }
+	val nonRepeatable = entries.filter {
+		it.type != DailyCaptureEntryType.FOOD && it.type != DailyCaptureEntryType.NOTE
+	}
 	require(nonRepeatable.map(DailyCaptureEntry::type).distinct().size == nonRepeatable.size) {
 		"Scalar entry types must be unique within a capture"
 	}
 	val notes = entries.filter { it.type == DailyCaptureEntryType.NOTE }
-	require(notes.isEmpty() || entries.size == 1) { "NOTE entries cannot be mixed with other entry types" }
 
 	val meals = entries.filter { it.type == DailyCaptureEntryType.FOOD }.map { entry ->
 		MealDraft(
@@ -375,7 +376,10 @@ internal fun projectDailyCaptureEntries(entries: List<DailyCaptureEntry>): Daily
 		stressLevel = entry(DailyCaptureEntryType.STRESS)?.value?.intValueExact(),
 		dailyNotes = entry(DailyCaptureEntryType.DAILY_NOTES)?.text,
 	)
-	val note = notes.singleOrNull()?.text
+	val note = notes.mapNotNull(DailyCaptureEntry::text)
+		.takeIf(List<String>::isNotEmpty)
+		?.joinToString("\n")
+	require(note == null || note.length <= 10_000) { "Combined NOTE text is too long" }
 	val type = when {
 		meals.isNotEmpty() && fields.hasValues() -> DailyCaptureType.MIXED
 		meals.isNotEmpty() -> DailyCaptureType.FOOD

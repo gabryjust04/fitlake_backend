@@ -1,5 +1,6 @@
 package com.fitlake.daily.application
 
+import ch.qos.logback.classic.Level
 import com.fitlake.daily.application.finalization.DailyDayReopeningService
 import com.fitlake.daily.application.finalization.DailyFinalizationService
 import com.fitlake.daily.application.finalization.DailyMetricsProjectionService
@@ -21,6 +22,9 @@ import com.fitlake.support.ImmediateTransactionExecutor
 import com.fitlake.support.InMemoryDailyCaptureRepository
 import com.fitlake.support.InMemoryDailyDayRepository
 import com.fitlake.support.InMemoryDailyMetricsRepository
+import com.fitlake.support.LogEventCapture
+import com.fitlake.support.renderedLogContent
+import com.fitlake.support.structuredFields
 import com.fitlake.user.domain.UserId
 import org.junit.jupiter.api.Test
 import java.math.BigDecimal
@@ -31,7 +35,9 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class DailyFinalizationServiceTest {
 	private val days = InMemoryDailyDayRepository()
@@ -146,6 +152,49 @@ class DailyFinalizationServiceTest {
 
 		assertEquals(first, second)
 		assertEquals(1, metrics.saveCount)
+	}
+
+	@Test
+	fun `real finalization logs one safe recalculation event and idempotent replay adds no info event`() {
+		val day = days.save(DailyDay.open(userId, date, now.minusSeconds(3600)))
+		captures.save(
+			DailyCapture.openFromUser(userId, day.dayId, fieldsPayload(), now.minusSeconds(3000))
+				.accept(now.minusSeconds(2500)),
+		)
+		captures.save(
+			DailyCapture.openFromUser(userId, day.dayId, foodPayload(), now.minusSeconds(2000))
+				.accept(now.minusSeconds(1500)),
+		)
+
+		LogEventCapture(DailyFinalizationService::class.java, Level.DEBUG).use { capture ->
+			val calculated = service.finalizeDay(userId, date)
+			val replayed = service.finalizeDay(userId, date)
+
+			assertEquals(calculated, replayed)
+			assertDecimal("78.4", calculated.bodyWeightKg)
+			val infoEvents = capture.events.filter { it.level == Level.INFO }
+			val recalculated = infoEvents.single()
+			val fields = recalculated.structuredFields()
+			assertEquals("daily_metrics_recalculated", fields["event"])
+			assertEquals("success", fields["outcome"])
+			assertEquals(userId.value, fields["userRef"])
+			assertEquals(day.dayId.value, fields["dayId"])
+			assertEquals(DailyDayStatus.OPEN, fields["oldStatus"])
+			assertEquals(DailyDayStatus.CONFIRMED, fields["newStatus"])
+			assertEquals(2, fields["acceptedCaptureCount"])
+			assertEquals(2, fields["foodItemCount"])
+			assertTrue((fields["durationMs"] as Number).toLong() >= 0L)
+			assertEquals(
+				1,
+				capture.events.count { it.structuredFields()["event"] == "daily_metrics_recalculation_skipped" },
+			)
+
+			val rendered = capture.events.renderedLogContent()
+			assertFalse(rendered.contains("78.4"))
+			assertFalse(rendered.contains("giornata positiva"))
+			assertFalse(rendered.contains("avena"))
+			assertFalse(rendered.contains("latte"))
+		}
 	}
 
 	@Test
@@ -313,6 +362,29 @@ class DailyFinalizationServiceTest {
 		metrics.save(stale)
 		assertFailsWith<DailyStateCorruptionException> {
 			reopening.reopenDay(userId, date)
+		}
+	}
+
+	@Test
+	fun `reopening logs one safe metrics stale event and replay is silent at info`() {
+		val day = days.save(DailyDay.open(userId, date, now.minusSeconds(3600)))
+		service.finalizeDay(userId, date)
+		val reopening = reopeningAt(now.plusSeconds(60))
+
+		LogEventCapture(DailyDayReopeningService::class.java, Level.DEBUG).use { capture ->
+			val reopened = reopening.reopenDay(userId, date)
+			assertEquals(reopened, reopening.reopenDay(userId, date))
+
+			val event = capture.events.single()
+			val fields = event.structuredFields()
+			assertEquals(Level.INFO, event.level)
+			assertEquals("daily_metrics_marked_stale", fields["event"])
+			assertEquals("success", fields["outcome"])
+			assertEquals(userId.value, fields["userRef"])
+			assertEquals(day.dayId.value, fields["dayId"])
+			assertEquals(DailyDayStatus.CONFIRMED, fields["oldStatus"])
+			assertEquals(DailyDayStatus.REOPENED, fields["newStatus"])
+			assertTrue((fields["durationMs"] as Number).toLong() >= 0L)
 		}
 	}
 

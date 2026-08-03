@@ -17,6 +17,7 @@ import com.fitlake.daily.application.capture.DailyManualCaptureService
 import com.fitlake.daily.application.capture.DailyCaptureService
 import com.fitlake.daily.application.port.DailyOwnedUserFood
 import com.fitlake.daily.application.port.DailyUserFoodLookupPort
+import com.fitlake.daily.domain.audit.DailyCaptureAuditAction
 import com.fitlake.daily.domain.capture.DailyFoodBasisSnapshot
 import com.fitlake.daily.domain.capture.DailyFoodConversionSnapshot
 import com.fitlake.daily.domain.capture.DailyFoodDefaultServingSnapshot
@@ -367,6 +368,28 @@ class DailyRestIntegrationTest @Autowired constructor(
 	}
 
 	@Test
+	fun `capture response aggregates nutrition across meals with strict unknown propagation`() {
+		val completeFoodId = UUID.fromString("12121212-1212-1212-1212-121212121212")
+		val unknownFiberFoodId = UUID.fromString("13131313-1313-1313-1313-131313131313")
+
+		mockMvc.post("/api/daily/days/2026-08-15/captures") {
+			auth("valid-a")
+			contentType = MediaType.APPLICATION_JSON
+			content = multiMealFoodCaptureBody(completeFoodId, unknownFiberFoodId)
+		}.andExpect {
+			status { isCreated() }
+			jsonPath("$.payload.entries.length()") { value(2) }
+			jsonPath("$.payload.entries[0].nutritionTotal.fiberGrams") { value(1) }
+			jsonPath("$.payload.entries[1].nutritionTotal.fiberGrams") { isEmpty() }
+			jsonPath("$.nutritionTotal.caloriesKcal") { value(124) }
+			jsonPath("$.nutritionTotal.proteinGrams") { value(19) }
+			jsonPath("$.nutritionTotal.carbohydratesGrams") { value(8.2) }
+			jsonPath("$.nutritionTotal.fatGrams") { value(0.4) }
+			jsonPath("$.nutritionTotal.fiberGrams") { isEmpty() }
+		}
+	}
+
+	@Test
 	fun `typed capture reads are user scoped and foreign food and capture remain hidden`() {
 		val foodId = UUID.fromString("22222222-2222-2222-2222-222222222222")
 		val created = mockMvc.post("/api/daily/days/2026-08-12/captures") {
@@ -475,12 +498,20 @@ class DailyRestIntegrationTest @Autowired constructor(
 		}
 
 		assertEquals(auditCountBefore + 1, audits.count())
-		val audit = audits.all().single { it.captureId.value.toString() == captureId }
+		val audit = audits.all().single {
+			it.captureId.value.toString() == captureId && it.action == DailyCaptureAuditAction.UI_EDIT
+		}
 		assertEquals(0L, audit.oldVersion)
 		assertEquals(1L, audit.newVersion)
 		assertEquals("rest-edit-1", audit.requestId)
-		assertEquals(BigDecimal("100"), audit.oldPayload.entries.single().items.single().enteredQuantity.amount)
-		assertEquals(BigDecimal.ONE, audit.newPayload.entries.single().items.single().enteredQuantity.amount)
+		assertEquals(
+			BigDecimal("100"),
+			requireNotNull(audit.oldPayload).entries.single().items.single().enteredQuantity.amount,
+		)
+		assertEquals(
+			BigDecimal.ONE,
+			requireNotNull(audit.newPayload).entries.single().items.single().enteredQuantity.amount,
+		)
 
 		mockMvc.put("/api/daily/captures/$captureId") {
 			auth("valid-a")
@@ -501,20 +532,137 @@ class DailyRestIntegrationTest @Autowired constructor(
 	}
 
 	@Test
-	fun `OpenAPI exposes Daily REST operations`() {
+	fun `OpenAPI documents Daily lifecycle semantics examples and principal errors`() {
 		mockMvc.get("/v3/api-docs")
 			.andExpect {
 				status { isOk() }
 				jsonPath("$.paths['/api/daily/days/{date}/captures']") { exists() }
 				jsonPath("$.paths['/api/daily/days/{date}/captures'].get") { exists() }
+				jsonPath("$.paths['/api/daily/days/{date}/captures'].post.responses['401']") { exists() }
+				jsonPath("$.paths['/api/daily/days/{date}/captures'].post.responses['409']") { exists() }
 				jsonPath("$.paths['/api/daily/captures/{captureId}']") { exists() }
+				jsonPath("$.paths['/api/daily/captures/{captureId}'].get.responses['401']") { exists() }
+				jsonPath("$.paths['/api/daily/captures/{captureId}'].get.responses['404']") { exists() }
 				jsonPath("$.paths['/api/daily/captures/{captureId}'].put") { exists() }
-				jsonPath("$.paths['/api/daily/captures/{captureId}'].put.requestBody.content['application/json'].examples['Full content replacement']") { exists() }
-				jsonPath("$.paths['/api/daily/captures/{captureId}'].put.responses['200'].content['*/*'].examples['Updated calculated capture']") { exists() }
+				jsonPath("$.paths['/api/daily/captures/{captureId}'].put.description") {
+					value(org.hamcrest.Matchers.containsString("complete new content"))
+				}
+				jsonPath("$.paths['/api/daily/captures/{captureId}'].put.description") {
+					value(org.hamcrest.Matchers.containsString("AI_ESTIMATE"))
+				}
+				jsonPath("$.components.schemas.DailyFoodItemRequest.properties.sourceType.description") {
+					value(org.hamcrest.Matchers.containsString("cannot create or edit an estimate"))
+				}
+				jsonPath("$.paths['/api/daily/days/{date}/metrics'].get.description") {
+					value(org.hamcrest.Matchers.containsString("REOPENED"))
+				}
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].put.requestBody.content" +
+						"['application/json'].examples['Full content replacement'].value.version",
+				) { value(4) }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].put.responses['200'].content" +
+						"['application/json'].examples['Updated calculated capture'].value.captureType",
+				) { value("MIXED") }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].put.responses['200'].content" +
+						"['application/json'].examples['Updated calculated capture'].value.payload.entries[0].mealType",
+				) { value("DINNER") }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].put.responses['200'].content" +
+						"['application/json'].examples['Updated calculated capture'].value.payload.entries[1].type",
+				) { value("WEIGHT") }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].put.responses['200'].content" +
+						"['application/json'].examples['Updated calculated capture'].value.version",
+				) { value(5) }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].put.responses['400'].content" +
+						"['application/json'].examples['Invalid content'].value.error",
+				) { value("validation_error") }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].put.responses['409'].content" +
+						"['application/json'].examples['Stale version'].value.error",
+				) { value("conflict") }
+
+				jsonPath("$.paths['/api/daily/captures/{captureId}/accept'].post.description") {
+					value(org.hamcrest.Matchers.containsString("OPEN capture to ACCEPTED"))
+				}
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}/accept'].post.responses['200'].content" +
+						"['application/json'].examples['Accepted capture'].value.status",
+				) { value("ACCEPTED") }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}/accept'].post.responses['409'].content" +
+						"['application/json'].examples['Capture not open'].value.error",
+				) { value("conflict") }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}/accept'].post.responses['401'].content" +
+						"['application/json'].examples['Unauthorized'].value.error",
+				) { value("unauthorized") }
+
+				jsonPath("$.paths['/api/daily/captures/{captureId}/reject'].post.description") {
+					value(org.hamcrest.Matchers.containsString("never contribute"))
+				}
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}/reject'].post.responses['200'].content" +
+						"['application/json'].examples['Rejected capture'].value.status",
+				) { value("REJECTED") }
+
+				jsonPath("$.paths['/api/daily/captures/{captureId}'].delete.description") {
+					value(org.hamcrest.Matchers.containsString("excluded from metrics"))
+				}
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].delete.responses['200'].content" +
+						"['application/json'].examples['Soft-deleted capture'].value.status",
+				) { value("SOFT_DELETED") }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].delete.responses['404'].content" +
+						"['application/json'].examples['Capture not found'].value.error",
+				) { value("not_found") }
+				jsonPath(
+					"$.paths['/api/daily/captures/{captureId}'].delete.responses['409'].content" +
+						"['application/json'].examples['Capture not deletable'].value.error",
+				) { value("conflict") }
+
 				jsonPath("$.paths['/api/daily/captures/{captureId}/content']") { doesNotExist() }
 				jsonPath("$.paths['/api/daily/captures/{captureId}/food-items/{itemTempId}']") { doesNotExist() }
-				jsonPath("$.paths['/api/daily/days/{date}/finalize']") { exists() }
-				jsonPath("$.paths['/api/daily/days/{date}/reopen']") { exists() }
+
+				jsonPath("$.paths['/api/daily/days/{date}/finalize'].post.description") {
+					value(org.hamcrest.Matchers.containsString("idempotent"))
+				}
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/finalize'].post.responses['200'].content" +
+						"['application/json'].examples['Confirmed metrics'].value.status",
+				) { value("CONFIRMED") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/finalize'].post.responses['409'].content" +
+						"['application/json'].examples['Open captures'].value.error",
+				) { value("conflict") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/finalize'].post.responses['404'].content" +
+						"['application/json'].examples['Day not found'].value.error",
+				) { value("not_found") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/finalize'].post.responses['500'].content" +
+						"['application/json'].examples['Inconsistent state'].value.error",
+				) { value("internal_server_error") }
+
+				jsonPath("$.paths['/api/daily/days/{date}/reopen'].post.description") {
+					value(org.hamcrest.Matchers.containsString("already REOPENED day is idempotent"))
+				}
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/reopen'].post.responses['200'].content" +
+						"['application/json'].examples['Reopened day'].value.status",
+				) { value("REOPENED") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/reopen'].post.responses['200'].content" +
+						"['application/json'].examples['Reopened day'].value.metrics.status",
+				) { value("REOPENED") }
+				jsonPath(
+					"$.paths['/api/daily/days/{date}/reopen'].post.responses['409'].content" +
+						"['application/json'].examples['Day still open'].value.error",
+				) { value("conflict") }
 			}
 	}
 
@@ -579,6 +727,31 @@ class DailyRestIntegrationTest @Autowired constructor(
 		}
 	""".trimIndent()
 
+	private fun multiMealFoodCaptureBody(firstFoodId: UUID, secondFoodId: UUID) = """
+		{
+		  "entries": [
+		    {
+		      "type": "FOOD",
+		      "mealType": "BREAKFAST",
+		      "items": [{
+		        "sourceType": "USER_FOOD",
+		        "userFoodId": "$firstFoodId",
+		        "quantity": {"amount": 100, "unit": "GRAM"}
+		      }]
+		    },
+		    {
+		      "type": "FOOD",
+		      "mealType": "LUNCH",
+		      "items": [{
+		        "sourceType": "USER_FOOD",
+		        "userFoodId": "$secondFoodId",
+		        "quantity": {"amount": 100, "unit": "GRAM"}
+		      }]
+		    }
+		  ]
+		}
+	""".trimIndent()
+
 	private fun replaceFoodContentBody(
 		version: Long,
 		entryId: String,
@@ -615,6 +788,7 @@ class DailyRestIntegrationTest @Autowired constructor(
 
 	class TestUserFoodLookup : DailyUserFoodLookupPort {
 		private val owners = ConcurrentHashMap<UUID, com.fitlake.user.domain.UserId>()
+		private val unknownFiberFoodId = UUID.fromString("13131313-1313-1313-1313-131313131313")
 
 		override fun findActiveOwnedFood(
 			userId: com.fitlake.user.domain.UserId,
@@ -632,7 +806,7 @@ class DailyRestIntegrationTest @Autowired constructor(
 					proteinGrams = BigDecimal("9.5"),
 					carbohydratesGrams = BigDecimal("4.1"),
 					fatGrams = BigDecimal("0.2"),
-					fiberGrams = BigDecimal("1"),
+					fiberGrams = if (userFoodId == unknownFiberFoodId) null else BigDecimal("1"),
 					sugarsGrams = BigDecimal("4.1"),
 					saturatedFatGrams = BigDecimal("0.1"),
 					sodiumMilligrams = BigDecimal("40"),

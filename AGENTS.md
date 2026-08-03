@@ -4,7 +4,7 @@
 
 FitLake is a personal daily tracking system.
 
-The primary product scope is the **Daily module**. The backend also contains a supporting private food-catalog module for manually managed reusable nutrition definitions. Manual Daily content links definitions by an exact selected `userFoodId`; natural-language insertion may read one exact and unique active owned name/alias match as described below. AI estimates never create or update catalog definitions.
+The primary product scope is the **Daily module**. The backend also contains a supporting private food-catalog module for manually managed reusable nutrition definitions. Manual Daily content links definitions by an exact selected `userFoodId`; natural-language insertion may read one exact match or one sufficiently strong and clearly separated prefix/fuzzy match among active owned foods as described below. AI estimates never create or update catalog definitions.
 
 The system tracks daily personal data such as:
 
@@ -152,9 +152,11 @@ Typical Telegram insertion flow:
 ```text
 User sends text
 → save raw input in daily_inbox_event
-→ AI interprets the text
-→ backend validates AI output
-→ backend creates daily_capture with status OPEN
+→ pure CaptureInterpreterPort returns one structured semantic outcome
+→ backend validates schema, verbatim fragments, quantities, and per-basis nutrition
+→ backend resolves each food through the owned catalog policy or AI fallback
+→ NO_RELEVANT_DATA completes without a capture
+→ otherwise backend creates daily_capture with status OPEN
 → bot shows the capture summary
 → user clicks "È corretto" or "Non è corretto"
 → capture becomes ACCEPTED or REJECTED
@@ -192,6 +194,8 @@ REST routes:
 POST   /api/daily/days/{date}/captures
 POST   /api/daily/days/{date}/messages
 GET    /api/daily/days/{date}
+GET    /api/daily/days/{date}/captures
+GET    /api/daily/captures/{captureId}
 POST   /api/daily/captures/{captureId}/accept
 POST   /api/daily/captures/{captureId}/reject
 POST   /api/daily/captures/{captureId}/reprocess
@@ -221,11 +225,12 @@ Important REST rules:
 * REST validation errors return `400`, missing resources return `404`, and invalid state transitions return `409`.
 * `POST /days/{date}/messages` and `POST /captures/{captureId}/reprocess` require an `Idempotency-Key` header.
 * One idempotency key represents one normalized complete text and terminal result. Reuse with different text is a conflict.
+* Reuse with the same normalized text reloads the established capture in its current lifecycle state, or replays `NO_RELEVANT_DATA` or a sanitized recorded failure, without another model call.
 * The AI endpoint accepts only `{ "text": "..." }`; structured capture JSON belongs to the manual endpoint.
 * A new AI message creates at most one ordinary `OPEN` capture with `created_by = AI` and a backend-owned source event.
 * Reprocess accepts only complete replacement text for an owned `OPEN` capture on an editable day.
-* Successful reprocess creates a distinct `OPEN` capture and atomically rejects the old proposal as `SYSTEM`.
-* Failed, invalid, clarification, or no-op reprocess leaves the old capture `OPEN` and unchanged.
+* A `COMPLETE`, `PARTIAL`, or `UNRESOLVED` reprocess creates a distinct `OPEN` capture and atomically rejects the old proposal as `SYSTEM`.
+* Failed or invalid reprocess, and a `NO_RELEVANT_DATA` result, leave the old capture `OPEN` and unchanged.
 * There is no conversation memory or relative AI edit flow.
 
 ---
@@ -241,7 +246,7 @@ daily capture = occurrence consumed on a date
 
 The catalog is authenticated, private, and manually managed. Its CRUD and frontend search operations remain independent from Daily and AI: creating, reading, updating, deleting, listing, or searching a user food must not create or modify a `daily_day`, `daily_capture`, `daily_inbox_event`, or `ai_interpretation_log`, and must not call Spring AI or an external nutrition provider.
 
-Daily has two narrow, read-only integration paths. Manual input may load one exact active owned definition after the frontend selects a `userFoodId`. Natural-language insertion may resolve an AI-extracted food name through `DailyAiUserFoodMatchPort`, but only against exact normalized active names and aliases owned by the authenticated user. Neither path may mutate the catalog or expose foreign/deleted definitions.
+Daily has two narrow, read-only integration paths. Manual input may load one exact active owned definition after the frontend selects a `userFoodId`. Natural-language insertion resolves AI-extracted `searchText` through `DailyAiUserFoodMatchPort`: exact active owned matches have priority; otherwise one prefix/fuzzy candidate may be accepted only by the conservative score-and-margin policy. Neither path may mutate the catalog or expose foreign/deleted definitions.
 
 REST routes:
 
@@ -379,9 +384,9 @@ Supported consumption units are `GRAM`, `KILOGRAM`, `MILLILITER`, `LITER`, `PIEC
 
 Typed capture entry/item IDs are backend-generated UUIDs. On full replacement, a supplied ID is valid only when it already belongs to the target owned capture. Omitted entries/items are removed. `PUT /api/daily/captures/{captureId}` is the only content-update endpoint; it requires the current capture version and atomically validates, resolves, calculates, persists, increments the version, and writes a `UI_EDIT` audit containing old/new payloads and versions. Stale versions return `409` without mutation.
 
-An `AI_ESTIMATE` item is created only by the natural-language insertion flow. Full replacement may preserve an existing estimated item only when its existing item ID, source type, and entered quantity are unchanged, or remove it by omission. A client must not create a new `AI_ESTIMATE`, change its quantity or nutrition, or convert it to another source through the full `PUT`; correction requires complete-text AI reprocess.
+An `AI_ESTIMATE` item is created only by the natural-language insertion flow. Full replacement may preserve it only when its existing item ID, source type, and entered quantity are unchanged; remove it by omission; or replace it with an exact active owned `USER_FOOD` reference while preserving the item ID. That conversion must use the current catalog snapshot and backend calculation. A client must not create a new `AI_ESTIMATE` or directly change its estimated quantity or nutrition. Use complete-text AI reprocess when interpretation itself must be regenerated.
 
-Payload JSONB is versioned centrally and only schema v2 is supported during development. Encoders always write version 2; readers reject missing, v1, non-integral, and unknown future versions. Existing development databases containing v1 capture or AI-audit JSONB must be recreated rather than supported by compatibility branches. AI catalog resolution must use the narrow application port and must not call catalog controllers, generic frontend search, or persistence APIs directly.
+Payload JSONB is versioned centrally and only schema v2 is supported during development. Encoders always write version 2; readers reject missing, v1, non-integral, and unknown future versions. Existing development databases containing v1 capture or AI-audit JSONB must be recreated rather than supported by compatibility branches. AI catalog resolution must use the narrow application port. Its infrastructure adapter may reuse `SearchUserFoodsUseCase` to obtain ranked candidates, but application/domain code must not call catalog controllers, JPA repositories, or persistence queries directly.
 
 `OPEN` captures and `ACCEPTED` captures on `OPEN` or `REOPENED` days may use full replacement; their state is preserved. `REJECTED`, `SOFT_DELETED`, `EXPIRED`, and captures on confirmed days are immutable. Finalization reads only authoritative stored v2 entries and their immutable nutrition snapshots; any derived projection is internal and never restores v1 wire compatibility.
 
@@ -395,17 +400,18 @@ AI may:
 
 * extract food items
 * extract quantities and units
-* estimate calories, protein, carbohydrates, and fat for the complete consumed quantity of every extracted food item
+* estimate a complete consumed quantity for each extracted food
+* estimate calories, protein, carbohydrates, and fat for an explicit nutrition basis for every extracted food item
 * infer meal names when reasonable
 * extract daily fields such as sleep or weight
-* produce a structured capture proposal
-* ask for clarification
-* return `NO_OP`
+* produce one pure structured interpretation
+* classify the message as `COMPLETE`, `PARTIAL`, `UNRESOLVED`, or `NO_RELEVANT_DATA`
 
 AI must not:
 
 * write SQL
 * call repositories
+* call application tools, functions, or persistence callbacks
 * generate canonical database IDs
 * persist data
 * modify accepted captures directly
@@ -415,32 +421,66 @@ AI must not:
 * put business logic into prompts
 * search the personal-food catalog or invent catalog IDs or matches
 
-AI output must be structured and validated before being saved.
+`CaptureInterpreterPort` is a pure outbound application port. Its request contains only the validated target date, authenticated user's timezone, and complete standalone text. Its response is a `DailyMessageInterpretation`; it has no repository, catalog, `DailyAiTerminalService`, or tool-callback dependency. Only backend application services may validate, resolve catalog candidates, allocate IDs, persist, or change state.
 
-The active prompt contract is `daily-capture-v2`. Every proposed food item must contain non-null, non-negative `calories`, `proteinG`, `carbsG`, and `fatG` values for that item's complete consumed quantity. Missing or invalid core estimates make the tool output invalid; missing nutrition alone is not a clarification reason.
+The active prompt contract is `daily-capture-v3`. The schema is always embedded in the system prompt through `BeanOutputConverter`, parsed with unknown-property rejection, and validated again in the backend. Provider-native OpenAI-compatible `response_format=json_schema` is optional and controlled by `fitlake.daily.ai.native-structured-output-enabled` / `FITLAKE_DAILY_AI_NATIVE_STRUCTURED_OUTPUT_ENABLED`. It defaults to `false`; keep it disabled for the current OpenRouter model because that model rejects native JSON Schema, and enable it only for a provider/model that explicitly supports it. Do not reintroduce tool calling as a fallback.
+
+Relevant runtime knobs and defaults:
+
+```text
+SPRING_AI_OPENAI_CHAT_MAX_TOKENS=4096
+FITLAKE_DAILY_AI_MAX_TEXT_LENGTH=4000
+FITLAKE_DAILY_AI_MAX_STRUCTURED_OUTPUT_RETRIES=1
+FITLAKE_DAILY_AI_NATIVE_STRUCTURED_OUTPUT_ENABLED=false
+FITLAKE_DAILY_AI_FOOD_MATCH_MINIMUM_SCORE=0.78
+FITLAKE_DAILY_AI_FOOD_MATCH_MINIMUM_MARGIN=0.12
+```
+
+Allowed semantic outcomes:
+
+```text
+COMPLETE
+PARTIAL
+UNRESOLVED
+NO_RELEVANT_DATA
+```
+
+Outcome rules:
+
+* `COMPLETE` contains at least one structured Daily fact and no unresolved fragments.
+* `PARTIAL` contains at least one structured fact plus exact unresolved source fragments; each unresolved fragment becomes a `NOTE` entry in the same `OPEN` proposal.
+* `UNRESOLVED` contains no structured facts; the backend preserves the complete original message as one `NOTE` entry in an `OPEN` proposal.
+* `NO_RELEVANT_DATA` contains no structured or unresolved facts, creates no capture, and is the only successful no-capture result.
+* There is no clarification outcome. Missing quantity or nutrition for a recognizable food is not a reason to omit it: the model must estimate them and record concise assumptions.
+
+Every food and field `originalFragment`, every `PARTIAL` unresolved fragment, and every `DAILY_NOTES.textValue` must be copied verbatim from the submitted text. Paraphrased or absent fragments, unknown fields, model-controlled IDs/state, inconsistent outcomes, invalid ranges, and invalid structure are rejected. A bounded corrective call may retry invalid structured output; `fitlake.daily.ai.max-structured-output-retries` defaults to `1` and must remain in `0..3`.
+
+Every proposed food item must contain:
+
+* nonblank `originalFragment` and `searchText`;
+* nullable `statedQuantity`, present only for a quantity explicitly stated by the user;
+* mandatory positive `estimatedQuantity` describing the model's best estimate of the complete consumed amount;
+* mandatory positive `nutritionEstimate.basis`;
+* non-null, non-negative calories, protein, carbohydrates, and fat for that basis, plus nullable non-negative optional nutrients;
+* an estimated quantity directly scalable from the nutrition basis: mass-to-mass, volume-to-volume, piece-to-piece, or serving-to-serving.
+
+The AI estimate is mandatory even when a catalog match is likely because it is the atomic fallback. The backend scales the estimate from its basis to the selected consumed quantity. Missing or invalid core estimates make the structured output invalid.
 
 After the model call, the backend resolves each food item independently:
 
-* `DailyAiUserFoodMatchPort` considers only exact normalized active names and aliases scoped to the authenticated internal `UserId`.
-* Prefix and fuzzy matches are never accepted automatically by the AI flow, even though they remain available to the frontend catalog search endpoint.
-* Zero exact matches means use the complete AI quartet.
-* More than one exact matching food is ambiguous and means use the complete AI quartet.
-* One exact match is used only when calories plus all three core macronutrients are present and the entered unit converts deterministically through the saved basis/default-serving/conversion metadata.
-* A usable unique match becomes `USER_FOOD`; backend calculation from its immutable snapshot replaces all four AI estimates.
-* An absent, ambiguous, nutritionally incomplete, or unconvertible match becomes `AI_ESTIMATE`; use all four AI values together and never mix catalog and AI nutrients within one item.
+* `DailyAiUserFoodMatchPort` is scoped to the authenticated internal `UserId` and returns candidates only from active owned foods.
+* One exact barcode/name/alias match wins. More than one exact match is ambiguous.
+* Without an exact match, a prefix/fuzzy candidate is accepted only when the best score is at least `fitlake.daily.ai.food-match.minimum-score` (default `0.78`) and, when a runner-up exists, leads it by at least `fitlake.daily.ai.food-match.minimum-margin` (default `0.12`). A first search result is never accepted blindly, and an approximate result is rejected when the bounded 50-candidate search window may be truncated.
+* An accepted catalog match is usable only when calories plus all three core macronutrients are present and the selected quantity converts deterministically through the saved basis/default-serving/conversion metadata.
+* Catalog quantity priority is: explicit `statedQuantity`, saved default serving, then `estimatedQuantity`.
+* A usable match becomes `USER_FOOD`; backend calculation from its immutable snapshot replaces the entire AI estimate.
+* An absent, ambiguous, weak, nutritionally incomplete, or unconvertible match becomes `AI_ESTIMATE`. Use `statedQuantity` only when it scales from the AI basis; otherwise use `estimatedQuantity`.
+* Use the complete AI nutrient set together and never mix catalog and AI nutrients within one item.
 * Never coerce missing catalog nutrients to zero.
 
-Both outcomes create an ordinary `OPEN` proposal and require user confirmation. An `AI_ESTIMATE` has no `userFoodId` or user-food snapshot and must never be inserted into or used to update the private catalog. Audit data should retain both the original AI estimate and the backend resolution outcome.
+`USER_FOOD` and `AI_ESTIMATE` items are both ordinary `OPEN` proposals and require user confirmation. An `AI_ESTIMATE` has no `userFoodId` or user-food snapshot and must never be inserted into or used to update the private catalog. Sanitized audit data retains the semantic outcome, retry/token counts, catalog decision, match type/score/reason, quantity source, and fallback outcome, but never provider raw output, prompts, secrets, tokens, credentials, or chain of thought.
 
-Allowed AI operations for MVP:
-
-```text
-CREATE_CAPTURE
-ASK_CLARIFICATION
-NO_OP
-```
-
-The only supported AI correction is complete-text reprocess of an `OPEN` proposal. Do not add relative, conversational, accepted-capture, or agentic AI modification flows unless explicitly requested.
+The only supported user-facing AI correction is complete-text reprocess of an `OPEN` proposal. The bounded structured-output retry only repairs the same provider response contract; it is not conversation memory or a capture edit. Do not add relative, conversational, accepted-capture, or agentic AI modification flows unless explicitly requested.
 
 ---
 
@@ -476,7 +516,9 @@ Application services should include:
 
 * `DailyCaptureOrchestrator`
 * `InboxEventService`
-* `AiCaptureInterpreterService`
+* `DailyAiMessageService`
+* `DailyAiTerminalService`
+* `DailyAiCaptureProposalFactory`
 * `DailyCaptureService`
 * `DailyCaptureEditService`
 * `DailyManualCaptureService`
@@ -486,7 +528,7 @@ Application services should include:
 * `UserFoodService`
 * `UserFoodSearchService`
 
-`SearchUserFoodsUseCase` is the frontend-facing catalog search boundary. Manual Daily content uses `DailyUserFoodLookupPort` for exact ownership-safe ID lookup. Natural-language resolution uses `DailyAiUserFoodMatchPort`, whose infrastructure adapter may query exact normalized active names/aliases and then return a Daily-owned read model. Application/domain code must not depend on catalog JPA repositories, JDBC queries, controllers, frontend ranking, or `pg_trgm` details.
+`CaptureInterpreterPort` is the pure provider boundary and returns data only; the backend terminal service owns all effects. `SearchUserFoodsUseCase` is the ranked catalog-search boundary used by the frontend and may be reused inside the infrastructure implementation of `DailyAiUserFoodMatchPort`. Manual Daily content uses `DailyUserFoodLookupPort` for exact ownership-safe ID lookup. Natural-language resolution receives ranked active owned candidates through the narrow AI port, applies exact-first and conservative score/margin policy, and returns a Daily-owned read model. Application/domain code must not depend directly on catalog JPA repositories, JDBC queries, controllers, or `pg_trgm` details.
 
 Do not put business logic in controllers.
 
@@ -547,6 +589,75 @@ Important rules:
 
 ---
 
+## Technical Logging Policy
+
+Technical logs describe application and infrastructure behavior. They are not durable business history and must never replace application persistence, `daily_capture_audit`, `ai_interpretation_log`, metrics, or distributed traces. These concerns remain separate:
+
+```text
+technical logs         = operational events and failures
+daily_capture_audit    = durable capture lifecycle and payload history
+ai_interpretation_log  = sanitized, durable AI execution metadata
+metrics                = aggregated system behavior
+traces                 = request and dependency paths
+```
+
+### Stack and structure
+
+* Application code uses SLF4J, with one local logger per class that emits meaningful events. Logback remains Spring Boot's logging backend.
+* Production output is structured ECS JSON written to stdout. The deployment platform, not business code, is responsible for collecting and forwarding stdout.
+* Do not call Logback APIs from production code, use `println`, write local rolling files by default, or send logs directly to a remote logging vendor.
+* Do not introduce a generic `LoggingService`, annotation-based logging around every method, or an elaborate logging framework. A small duration or constants helper is acceptable when it does not hide SLF4J.
+* Significant application events use SLF4J fluent key-value logging. The stable machine-queryable `event` value uses lowercase `snake_case`, normally `<domain>_<resource>_<action>`, and the human message remains concise.
+* Use stable fields where applicable, such as `outcome`, `requestId`, `userRef`, resource IDs, status, old/new version, counts, `durationMs`, provider/model/prompt version, and a normalized `errorCode`. Do not use exception messages as error codes or emit null-heavy records.
+* Measure elapsed time with `System.nanoTime()`, not wall-clock timestamps. Do not log every method, repository call, or normal framework operation.
+* Logging stays outside pure domain objects. Meaningful business events belong in application use cases/orchestrators; HTTP completion and external-provider details belong at their infrastructure boundaries. Controllers normally rely on those layers and centralized exception handling.
+
+### Privacy and data minimization
+
+The restrictions below apply at every level, including `TRACE` and `DEBUG`. Technical logs must never contain:
+
+* authorization headers, Firebase ID or refresh tokens, cookies, passwords, API keys, service-account JSON, private keys, database credentials, or complete JWT claims;
+* email addresses, phone numbers, personal names or addresses, Firebase subjects/UIDs, or other external identity contents;
+* actual foods or food names, nutrition values, body weight, pain, mood, stress, focus, sleep, notes, unstructured activity text, full Daily payloads, or complete personal-food definitions;
+* user messages, prompts, model responses, raw provider responses, full structured AI output, chain of thought, hidden reasoning, or provider credentials;
+* request or response bodies, multipart contents, raw query strings, sensitive query parameters, or command/DTO serialization.
+
+Do not add request/response body-caching logging filters. Prefer privacy-safe metadata such as content length, entry/food counts, capture type, presence flags, result count, match type, coarse score bucket, retry count, token usage, IDs, status, and elapsed duration. An internal FitLake UUID may be logged as `userRef` only for a meaningful user-owned operation; never log email or Firebase UID, include `userRef` indiscriminately, or use user IDs as metric tags.
+
+Exception messages may contain user or provider content. Include a throwable only at the single boundary responsible for an unexpected failure, and never copy its raw message into a structured field without proving it is sanitized.
+
+### HTTP correlation and completion
+
+* Every HTTP request resolves an optional `X-Request-Id`. Accept only 1 to 100 letters, digits, dots, underscores, or hyphens; otherwise generate a UUID.
+* Store the resolved value as `requestId` in SLF4J MDC for the complete synchronous servlet request, return it in the `X-Request-Id` response header, and always clear it in `finally`/`MDC.putCloseable`, including exceptional paths. Reused server threads must never inherit a prior request's MDC.
+* Emit one `http_request_completed` event after a normal request. Include method, resolved route template, response status, outcome, request ID, and monotonic `durationMs`. Do not log both request start and completion at `INFO` without a demonstrated need.
+* Prefer a route template such as `/api/daily/captures/{captureId}` over a concrete URL. Never fall back to raw paths or query strings that may expose identifiers or content. Noisy probes such as health may log at a lower level.
+* Existing trace/span identifiers supplied by a future Micrometer tracing integration may coexist with `requestId`; they do not replace its validation, response header, or cleanup behavior.
+
+The current application has no application-owned `@Async`, coroutine-dispatcher, scheduled, custom-executor, or reactive request handoff, so the MDC guarantee is limited to the synchronous servlet chain. If asynchronous work is added, use Spring-supported context propagation and add tests for both MDC/observation propagation and cleanup; do not assume thread-local MDC crosses an executor boundary.
+
+### Levels and exception ownership
+
+* `TRACE` is exceptional local diagnostics and remains off in production. `DEBUG` is for sanitized internal decisions. `INFO` records meaningful successful lifecycle, authentication provisioning, catalog, Daily, AI, and HTTP completion events. `WARN` records recoverable degradation, retries, rejected authentication, stale/version conflicts, and other actionable expected conditions. `ERROR` is reserved for unexpected failures or unavailable dependencies that prevent the operation.
+* Expected validation, not-found, state-transition, idempotency, and optimistic-lock/domain conflicts normally return their safe `4xx` response without an `ERROR` stack trace. Add an `INFO`/`WARN` event only when it has operational value.
+* Unexpected exceptions are logged once, at the outermost boundary that converts them to the safe `500` response, with stable event/error code, exception type, request ID from MDC, and the stack trace. Never return exception messages or stack traces to the client.
+* A local catch may log only when it handles/translates the failure, adds otherwise unavailable context, and prevents duplicate outer logging. Do not log a stack trace and then simply rethrow it.
+* Authentication failures use normalized codes and sanitized metadata only. Successful token verification does not need an `INFO` event on every request when HTTP and application events already provide visibility.
+* Full capture changes remain solely in `daily_capture_audit`. AI technical events may summarize provider, model, prompt version, outcome, retry/token/count metadata and duration, while `ai_interpretation_log` remains the sanitized operational record. Neither full audit payloads nor AI content may be copied into technical logs.
+
+### Configuration and operations
+
+* Common defaults are root/application `INFO`, Spring framework `WARN`, Hibernate SQL `WARN`, and JDBC bind-parameter logging `OFF`.
+* The `dev` profile keeps human-readable stdout and enables `com.fitlake` `DEBUG`; it still does not enable SQL bind values.
+* The `test` profile reduces noise while retaining application events useful for diagnosing failures.
+* The `prod` profile uses Spring Boot's native ECS structured console format at `INFO`, on stdout, with SQL bind logging disabled. Do not add a competing JSON encoder or `logback-spring.xml` unless a requirement cannot be represented by supported Spring Boot properties.
+* Only the intended health endpoint may be public. The Actuator `loggers` endpoint is not exposed by default; never expose it, or a broad endpoint wildcard, without operator authorization and a private/dedicated management boundary. Temporary package `DEBUG` currently requires a logging-level environment override and application restart.
+* Production log access and retention must be restricted because library stack traces can still reveal technical internals even when application fields are sanitized.
+
+Logging tests must inspect event names and structured key-value fields rather than complete formatted lines. Cover request-ID validation, response propagation, MDC cleanup on success and failure, no cross-request leakage, safe route templates, one unexpected-exception log, absence of stack traces for expected errors, representative application events, profile configuration, Actuator exposure, and conspicuous fake secrets/content never appearing in captured output. Tests must not require a remote logging platform or real credentials.
+
+---
+
 ## MVP Database
 
 Use PostgreSQL.
@@ -566,13 +677,14 @@ The MVP database contains these tables:
 4. daily_day
 5. daily_inbox_event
 6. daily_capture
-7. ai_interpretation_log
-8. daily_metrics
-9. user_food
-10. user_food_alias
+7. daily_capture_audit
+8. ai_interpretation_log
+9. daily_metrics
+10. user_food
+11. user_food_alias
 ```
 
-`user_food` and `user_food_alias` were explicitly introduced for the private manual catalog by Flyway V4. Do not introduce further database tables unless a task explicitly requires it.
+`user_food` and `user_food_alias` were introduced by Flyway V4, `daily_capture_audit` by V5, its lifecycle coverage was expanded by V6, and V7 added composite owner foreign keys across Daily rows without adding tables. Application ownership checks remain mandatory even though the database now also rejects cross-tenant links. Do not introduce further database tables unless a task explicitly requires it.
 
 V4 also enables `pg_trgm`. Local and production PostgreSQL installations must provide this extension, and the Flyway role must be allowed to execute `CREATE EXTENSION IF NOT EXISTS pg_trgm`.
 
@@ -894,7 +1006,7 @@ Important rules:
 * Use `processing_started_at` as a renewable processing lease so a crashed request does not reserve an idempotency key forever.
 * Use `processing_attempt_id` as the fencing token. A worker may commit or record failure only while its attempt still owns the current lease.
 * A source event may create at most one capture; enforce this in PostgreSQL as well as application code.
-* `replaces_capture_id` is the single audit link from a reprocess event to the old proposal.
+* `replaces_capture_id` links a reprocess inbox event to the old proposal; `daily_capture_audit.related_capture_id` provides the lifecycle link from that old proposal to the newly created replacement.
 * Do not put business state in this table.
 * This is an operational/audit table, not the final daily state.
 
@@ -989,6 +1101,51 @@ Important rules:
 * Soft delete should set status to `SOFT_DELETED` or `deleted_at`, not physically delete the row.
 * Only `ACCEPTED` captures are used for finalization.
 * `REJECTED`, `EXPIRED`, and `SOFT_DELETED` captures must not contribute to `daily_metrics`.
+
+---
+
+## Table: daily_capture_audit
+
+Stores immutable, owner-scoped capture lifecycle and content-change records.
+
+Expected columns:
+
+```text
+audit_id UUID PK
+capture_id UUID
+user_id UUID
+action VARCHAR
+actor VARCHAR
+old_payload JSONB nullable
+new_payload JSONB nullable
+old_status VARCHAR nullable
+new_status VARCHAR nullable
+old_version BIGINT nullable
+new_version BIGINT nullable
+reason_code VARCHAR nullable
+related_capture_id UUID nullable
+request_id VARCHAR nullable
+created_at TIMESTAMPTZ
+```
+
+Allowed actions:
+
+```text
+CREATE
+ACCEPT
+REJECT
+UI_EDIT
+SOFT_DELETE
+REPLACED_BY_REPROCESS
+```
+
+Important rules:
+
+* Capture creation and its `CREATE` audit row are committed in the same transaction; the actor is `AI` or `USER_UI`.
+* User accept, reject, edit, and soft-delete operations record their corresponding transition in the same transaction as the capture mutation.
+* A successful AI reprocess creates and audits the new `OPEN` capture, then records `REPLACED_BY_REPROCESS` on the old capture with actor `SYSTEM`, reason code `REPLACED_BY_REPROCESS`, and `related_capture_id` pointing to the new capture.
+* Status-only lifecycle actions do not duplicate payload JSON. `UI_EDIT` records old/new payloads and versions; `CREATE` records only the new payload.
+* Failed, invalid, or `NO_RELEVANT_DATA` reprocess must not write a replacement lifecycle audit or mutate the old capture.
 
 ---
 
@@ -1136,7 +1293,7 @@ Rules:
 
 ## Table: ai_interpretation_log
 
-Stores AI input/output for debugging and evaluation.
+Stores sanitized AI terminal metadata and replay projections for debugging and evaluation. The raw user input remains in `daily_inbox_event`.
 
 Expected columns:
 
@@ -1148,9 +1305,9 @@ capture_id UUID FK daily_capture nullable
 provider VARCHAR
 model VARCHAR
 prompt_version VARCHAR
-input_text TEXT
+input_text TEXT nullable
 context_snapshot JSONB nullable
-raw_response JSONB nullable
+raw_response JSONB nullable (unused; must remain null)
 parsed_output JSONB nullable
 status VARCHAR
 confidence NUMERIC nullable
@@ -1173,23 +1330,24 @@ Allowed statuses:
 SUCCESS
 FAILED
 INVALID_OUTPUT
-NEEDS_CLARIFICATION
-NO_OP
+NO_RELEVANT_DATA
 ```
 
 Purpose:
 
 * debug wrong AI interpretations
 * compare prompt versions
-* inspect model outputs
+* inspect sanitized interpretation and resolution summaries
 * understand why a capture was created
 * measure latency and reliability
 
 Important rules:
 
 * Do not store secrets in this table.
-* Store the immutable terminal result needed for idempotent replay; do not replay a later mutable state of the capture.
-* Do not store provider raw responses, chain of thought, Firebase tokens, API keys, prompts containing secrets, or credentials.
+* Store a sanitized terminal summary for idempotency. Successful replay resolves the established capture and returns its current lifecycle state; it must not duplicate a stale full payload inside the AI log.
+* Current AI logs set `input_text = null` because the authoritative original text already belongs to `daily_inbox_event`.
+* Keep `raw_response = null`. Do not store provider raw responses, chain of thought, Firebase tokens, API keys, prompts containing secrets, or credentials.
+* `context_snapshot` and `parsed_output` may contain only sanitized metadata and projections needed for audit/replay: semantic outcome, retry/token counts, capture summary, and food-resolution decisions.
 * Do not rely on this table for business state.
 * Business state belongs to `daily_capture` and `daily_metrics`.
 
@@ -1214,7 +1372,7 @@ caffeine_mg INTEGER nullable
 mood_level SMALLINT nullable
 focus_level SMALLINT nullable
 stress_level SMALLINT nullable
-total_calories INTEGER nullable
+total_calories NUMERIC(18,6) nullable
 protein_g NUMERIC nullable
 carbs_g NUMERIC nullable
 fat_g NUMERIC nullable
@@ -1500,11 +1658,13 @@ Minimum validations:
 * field name is supported
 * field value type is correct
 * day is not finalized unless the use case allows reopening/recalculation
-* every AI food proposal contains non-null, non-negative calories, protein, carbohydrates, and fat within defensive bounds
-* every AI nutrition value describes the complete extracted consumed quantity
-* an automatic catalog match is exact, unique, active, owned, nutritionally complete for the four core values, and deterministically convertible
-* an AI fallback uses the complete estimate quartet without mixing catalog nutrients
-* a full-content request can only preserve or remove an existing `AI_ESTIMATE`; it cannot create or modify one
+* every AI food proposal contains a positive estimated quantity, a positive nutrition basis, and non-null, non-negative calories, protein, carbohydrates, and fat for that basis within defensive bounds
+* the AI estimated quantity scales deterministically from its nutrition basis
+* every model source fragment and unresolved fragment is present verbatim in the original text
+* every semantic outcome satisfies its structured/unresolved-content invariant
+* an automatic catalog match is active, owned, accepted by exact-first plus strong score/margin policy, nutritionally complete for the four core values, and deterministically convertible
+* an AI fallback scales the complete estimate from its basis without mixing catalog nutrients
+* a full-content request can preserve or remove an existing `AI_ESTIMATE`, or convert that logical item to an exact active `USER_FOOD`; it cannot create or directly modify an estimate
 
 For the private food catalog also validate:
 
@@ -1536,19 +1696,20 @@ Transaction 1:
 - save daily_inbox_event
 
 Outside transaction:
-- call AI
-- parse AI output
-- validate the complete AI estimate quartet for every food
-- resolve each food through short reads on the exact user-scoped catalog match port
+- call the pure `CaptureInterpreterPort`
+- parse and validate the structured outcome, strict schema, verbatim fragments, quantities, and per-basis nutrition estimate
+- resolve each food through short reads on the user-scoped ranked catalog-match port and conservative exact/score/margin policy
 - build and validate the schema-v2 `USER_FOOD` or `AI_ESTIMATE` payload
 
 Transaction 2:
-- save ai_interpretation_log
-- create daily_capture
-- mark inbox event as PROCESSED
+- lock the inbox event and day, plus the previous capture for reprocess
+- create the new OPEN capture and its CREATE lifecycle audit when the outcome is not NO_RELEVANT_DATA
+- for reprocess success, reject the old capture and write REPLACED_BY_REPROCESS with the new capture link
+- save the sanitized ai_interpretation_log terminal record
+- mark the inbox event PROCESSED, or IGNORED for NO_RELEVANT_DATA
 ```
 
-For reprocess, the short terminal transaction must lock in the order `inbox event → day → previous capture`, create the new capture, reject the old proposal, write the terminal audit, and complete the event atomically. Never reject the old capture before the new one is valid and persisted.
+For a capture-producing reprocess, the short terminal transaction must lock in the order `inbox event → day → previous capture`, create the new capture, reject the old proposal, write the terminal audit, and complete the event atomically. Never reject the old capture before the new one is valid and persisted. A `NO_RELEVANT_DATA` reprocess records its terminal result and leaves the old capture unchanged.
 
 The network/model call always occurs outside a database transaction. A stale `PROCESSING` event may renew its lease and retry; database uniqueness on `source_event_id` remains the final duplicate-capture guard.
 
@@ -1729,7 +1890,7 @@ Never create daily metrics from rejected or open captures.
 
 Never skip backend validation because the AI output seems correct.
 
-Never introduce correction/modification AI flows unless explicitly requested.
+Never introduce conversational or relative AI capture-modification flows unless explicitly requested.
 
 Never create a Daily capture as a side effect of personal-food CRUD or search.
 
@@ -1743,7 +1904,7 @@ Never convert between mass/volume and piece/serving without explicit conversion 
 
 Never update historical Daily data when a catalog definition changes or is soft-deleted.
 
-Never use prefix or fuzzy catalog matches for automatic AI nutrition resolution.
+Never accept a prefix or fuzzy catalog candidate automatically unless it satisfies the configured minimum score and, when a runner-up exists, the configured minimum lead.
 
 Never mix catalog and AI values within one resolved food item.
 
@@ -1781,15 +1942,19 @@ Prioritize tests for:
 * invalid and expired Firebase tokens
 * public health and protected API endpoint policy
 * authentication identity uniqueness and persistence mapping
-* one terminal AI tool and defensive rejection of zero/multiple/unknown tools or free text
-* prompt `daily-capture-v2` and required decimal calories/protein/carbohydrates/fat for every proposed food item
+* pure `CaptureInterpreterPort` with no tool callbacks, terminal-service dependency, or persistence side effect
+* prompt `daily-capture-v3`, strict JSON conversion, optional native JSON Schema mode, and bounded corrective retries
+* `COMPLETE`, `PARTIAL`, `UNRESOLVED`, and `NO_RELEVANT_DATA` outcome invariants
+* verbatim food/field/unresolved/note fragments and defensive rejection of tool calls, prose, unknown fields, and backend-owned fields
+* required positive estimated quantity and basis plus decimal calories/protein/carbohydrates/fat for every proposed food item
 * rejection of missing, negative, or out-of-range AI nutrition estimates without a partial capture
-* exact unique owned name/alias catalog match overriding the complete AI estimate
-* no-match, ambiguous-match, incomplete-catalog, and unconvertible-catalog fallback to the complete AI quartet
-* prefix/fuzzy and foreign/deleted food exclusion from automatic AI matching
+* exact unique owned barcode/name/alias catalog match overriding the complete AI estimate
+* strong, clearly separated prefix/fuzzy candidate acceptance at the configured score and margin boundaries
+* no-match, weak/ambiguous-match, incomplete-catalog, and unconvertible-catalog fallback to the scaled AI estimate
+* foreign/deleted food exclusion from automatic AI matching
 * no mixing of catalog and AI nutrients, and no catalog mutation from AI estimates
-* preservation/removal-only semantics for existing `AI_ESTIMATE` items in full-content replacement
-* AI message idempotency, immutable replay, and stale-processing recovery
+* preservation/removal/conversion-to-`USER_FOOD` semantics for existing `AI_ESTIMATE` items in full-content replacement
+* AI message idempotency, current-state capture replay, and stale-processing recovery on the originally persisted raw input
 * complete-text reprocess success and failure invariants
 * atomic replacement rollback and concurrent reprocess locking on PostgreSQL
 * private-food creation, backend-generated identity, retrieval, full-definition replacement, and soft deletion
@@ -1831,7 +1996,7 @@ A task is done only when:
 * Daily linked-food captures preserve an immutable nutrition snapshot rather than reading mutable catalog values as history
 * capture APIs and JSONB use schema v2 only, with one atomic full-replacement PUT and no granular or v1 compatibility routes
 * new AI food captures use schema v2 and preserve either an immutable `USER_FOOD` snapshot or a complete `AI_ESTIMATE`
-* exact AI catalog resolution remains user-scoped, unique, non-fuzzy, nutritionally complete, and deterministically convertible
+* AI catalog resolution remains user-scoped, exact-first, conservative for prefix/fuzzy candidates, nutritionally complete, and deterministically convertible
 * AI fallback estimates remain confirmable Daily state and never mutate the personal-food catalog
 * Telegram and mobile flows still use shared backend services
 * daily finalization remains deterministic, aggregates every supported metric, and refinalization updates the reopened snapshot without duplication

@@ -6,9 +6,11 @@ import com.fitlake.daily.application.port.DailyDayRepository
 import com.fitlake.daily.domain.audit.DailyCaptureAudit
 import com.fitlake.daily.domain.audit.DailyCaptureAuditAction
 import com.fitlake.daily.domain.capture.DailyCapture
+import com.fitlake.daily.domain.capture.DailyCaptureActor
 import com.fitlake.daily.domain.capture.DailyCaptureEntry
 import com.fitlake.daily.domain.capture.DailyCaptureEntryType
 import com.fitlake.daily.domain.capture.DailyCapturePayload
+import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.daily.domain.capture.DailyEnteredQuantity
 import com.fitlake.daily.domain.capture.DailyFoodBasisSnapshot
 import com.fitlake.daily.domain.capture.DailyFoodCaptureItem
@@ -59,6 +61,7 @@ import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @DataJpaTest(
@@ -143,6 +146,36 @@ class DailyCaptureAuditPersistenceIntegrationTest @Autowired constructor(
 	}
 
 	@Test
+	fun `CREATE audit persists initial version without an old state`() {
+		val payload = weightPayload("78.4")
+		val capture = createCapture(payload)
+
+		val saved = transactions.required {
+			audits.save(
+				DailyCaptureAudit.create(
+					captureId = capture.captureId,
+					userId = capture.userId,
+					newPayload = capture.payload,
+					actor = DailyCaptureActor.USER_UI,
+					requestId = null,
+					at = capture.createdAt,
+				),
+			)
+		}
+		val loaded = audits.findAllByCaptureIdAndUserId(capture.captureId, userId).single()
+
+		assertEquals(saved, loaded)
+		assertEquals(DailyCaptureAuditAction.CREATE, loaded.action)
+		assertEquals(DailyCaptureActor.USER_UI, loaded.actor)
+		assertNull(loaded.oldPayload)
+		assertEquals(payload, loaded.newPayload)
+		assertNull(loaded.oldStatus)
+		assertEquals(DailyCaptureStatus.OPEN, loaded.newStatus)
+		assertNull(loaded.oldVersion)
+		assertEquals(0, loaded.newVersion)
+	}
+
+	@Test
 	fun `invalid audit rolls back the capture update atomically`() {
 		val payload = weightPayload("78")
 		val capture = createCapture(payload)
@@ -209,6 +242,83 @@ class DailyCaptureAuditPersistenceIntegrationTest @Autowired constructor(
 	}
 
 	@Test
+	fun `Flyway exposes nullable AI input and the current interpretation statuses`() {
+		assertEquals(
+			"YES",
+			jdbcTemplate.queryForObject(
+				"""
+				SELECT is_nullable
+				FROM information_schema.columns
+				WHERE table_schema = 'public'
+				  AND table_name = 'ai_interpretation_log'
+				  AND column_name = 'input_text'
+				""".trimIndent(),
+				String::class.java,
+			),
+		)
+		val statusConstraint = requireNotNull(
+			jdbcTemplate.queryForObject(
+				"""
+				SELECT pg_get_constraintdef(oid)
+				FROM pg_constraint
+				WHERE conname = 'ck_ai_interpretation_log_status'
+				""".trimIndent(),
+				String::class.java,
+			),
+		)
+		assertTrue(statusConstraint.contains("NO_RELEVANT_DATA"))
+		assertTrue(!statusConstraint.contains("NO_OP"))
+		assertTrue(!statusConstraint.contains("NEEDS_CLARIFICATION"))
+	}
+
+	@Test
+	fun `Flyway rejects cross tenant Daily references and a mismatched metrics date`() {
+		val captureA = createCapture(weightPayload("78"))
+		val userB = createUser("tenant-foreign")
+		val dayB = transactions.required { days.save(DailyDay.open(userB, date, now)) }
+		val inboxA = insertInbox(userId.value, captureA.dayId.value)
+
+		assertFailsWith<DataIntegrityViolationException> {
+			insertInbox(userB.value, captureA.dayId.value)
+		}
+		assertFailsWith<DataIntegrityViolationException> {
+			jdbcTemplate.update(
+				"""
+				INSERT INTO daily_capture
+				    (capture_id, user_id, day_id, capture_type, status, payload, created_by)
+				VALUES (?, ?, ?, 'NOTE', 'OPEN', CAST(? AS JSONB), 'USER_UI')
+				""".trimIndent(),
+				UUID.randomUUID(), userB.value, captureA.dayId.value, "{}",
+			)
+		}
+		assertFailsWith<DataIntegrityViolationException> {
+			jdbcTemplate.update(
+				"""
+				INSERT INTO daily_capture
+				    (capture_id, user_id, day_id, source_event_id, capture_type, status, payload, created_by)
+				VALUES (?, ?, ?, ?, 'NOTE', 'OPEN', CAST(? AS JSONB), 'USER_UI')
+				""".trimIndent(),
+				UUID.randomUUID(), userB.value, dayB.dayId.value, inboxA, "{}",
+			)
+		}
+		assertFailsWith<DataIntegrityViolationException> {
+			insertInbox(userB.value, dayB.dayId.value, captureA.captureId.value)
+		}
+		assertFailsWith<DataIntegrityViolationException> {
+			insertAiLog(userB.value, inboxEventId = inboxA)
+		}
+		assertFailsWith<DataIntegrityViolationException> {
+			insertAiLog(userB.value, captureId = captureA.captureId.value)
+		}
+		assertFailsWith<DataIntegrityViolationException> {
+			insertMetrics(captureA.dayId.value, userB.value, date)
+		}
+		assertFailsWith<DataIntegrityViolationException> {
+			insertMetrics(captureA.dayId.value, userId.value, date.plusDays(1))
+		}
+	}
+
+	@Test
 	fun `PostgreSQL JSONB preserves six decimal precision for large snapshot nutrients`() {
 		val precise = BigDecimal("999999999999.123456")
 		val nutrition = DailyNutritionValues(sodiumMilligrams = precise)
@@ -259,6 +369,41 @@ class DailyCaptureAuditPersistenceIntegrationTest @Autowired constructor(
 	private fun createCapture(payload: DailyCapturePayload): DailyCapture = transactions.required {
 		val day = days.save(DailyDay.open(userId, date, now))
 		captures.save(DailyCapture.openFromUser(userId, day.dayId, payload, now))
+	}
+
+	private fun insertInbox(user: UUID, day: UUID, replacesCapture: UUID? = null): UUID {
+		val id = UUID.randomUUID()
+		jdbcTemplate.update(
+			"""
+			INSERT INTO daily_inbox_event
+			    (inbox_event_id, user_id, day_id, channel, source_type, processing_status,
+			     processing_started_at, processing_attempt_id, replaces_capture_id)
+			VALUES (?, ?, ?, 'TEST', 'MOBILE_AI_INPUT', 'PROCESSING', CURRENT_TIMESTAMP, ?, ?)
+			""".trimIndent(),
+			id, user, day, UUID.randomUUID(), replacesCapture,
+		)
+		return id
+	}
+
+	private fun insertAiLog(user: UUID, inboxEventId: UUID? = null, captureId: UUID? = null) {
+		jdbcTemplate.update(
+			"""
+			INSERT INTO ai_interpretation_log
+			    (ai_log_id, user_id, inbox_event_id, capture_id, provider, model, prompt_version, status)
+			VALUES (?, ?, ?, ?, 'TEST', 'test-model', 'test-prompt', 'SUCCESS')
+			""".trimIndent(),
+			UUID.randomUUID(), user, inboxEventId, captureId,
+		)
+	}
+
+	private fun insertMetrics(day: UUID, user: UUID, metricsDate: LocalDate) {
+		jdbcTemplate.update(
+			"""
+			INSERT INTO daily_metrics (day_id, user_id, day_date, status)
+			VALUES (?, ?, ?, 'OPEN')
+			""".trimIndent(),
+			day, user, metricsDate,
+		)
 	}
 
 	private fun createUser(prefix: String): UserId {

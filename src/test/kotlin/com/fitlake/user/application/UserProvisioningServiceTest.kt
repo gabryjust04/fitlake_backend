@@ -1,8 +1,12 @@
 package com.fitlake.user.application
 
+import ch.qos.logback.classic.Level
+import com.fitlake.shared.application.TransactionExecutor
 import com.fitlake.support.ImmediateTransactionExecutor
 import com.fitlake.support.InMemoryUserAccountRepository
 import com.fitlake.support.InMemoryUserAuthIdentityRepository
+import com.fitlake.support.LogEventCapture
+import com.fitlake.support.structuredFields
 import com.fitlake.user.domain.AuthProvider
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -10,7 +14,10 @@ import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
 
 class UserProvisioningServiceTest {
 	private val accounts = InMemoryUserAccountRepository()
@@ -25,7 +32,22 @@ class UserProvisioningServiceTest {
 
 	@Test
 	fun `first valid login provisions an internal user and identity`() {
-		val account = serviceAt(firstLogin).provision(command())
+		val account = LogEventCapture(UserProvisioningService::class.java).use { capture ->
+			val provisioned = serviceAt(firstLogin).provision(command())
+			val event = capture.events.single()
+			val fields = event.structuredFields()
+			assertEquals(Level.INFO, event.level)
+			assertEquals("user_account_provisioned", fields["event"])
+			assertEquals("success", fields["outcome"])
+			assertEquals("firebase", fields["authProvider"])
+			assertEquals(provisioned.userId.value, fields["userRef"])
+			val rendered = event.formattedMessage + fields.entries.joinToString()
+			assertFalse(rendered.contains(command().email!!))
+			assertFalse(rendered.contains(command().externalSubject))
+			assertFalse(rendered.contains(command().issuer))
+			assertFalse(rendered.contains(command().displayName!!))
+			provisioned
+		}
 
 		assertEquals(1, accounts.count())
 		assertEquals(1, identities.count())
@@ -37,7 +59,11 @@ class UserProvisioningServiceTest {
 	fun `existing identity resolves the existing user`() {
 		val first = serviceAt(firstLogin).provision(command())
 
-		val repeated = serviceAt(firstLogin.plusSeconds(60)).provision(command())
+		val repeated = LogEventCapture(UserProvisioningService::class.java).use { capture ->
+			serviceAt(firstLogin.plusSeconds(60)).provision(command()).also {
+				assertTrue(capture.events.isEmpty())
+			}
+		}
 
 		assertEquals(first.userId, repeated.userId)
 		assertEquals(1, accounts.count())
@@ -116,10 +142,30 @@ class UserProvisioningServiceTest {
 		assertEquals(firstLogin, updated.updatedAt)
 	}
 
-	private fun serviceAt(now: Instant) = UserProvisioningService(
+	@Test
+	fun `failed transaction does not emit a provisioning success event`() {
+		val failingCommit = object : TransactionExecutor {
+			override fun <T : Any> required(action: () -> T): T {
+				action()
+				throw IllegalStateException("commit failed for private-user@example.com")
+			}
+		}
+
+		LogEventCapture(UserProvisioningService::class.java).use { capture ->
+			assertFailsWith<IllegalStateException> {
+				serviceAt(firstLogin, failingCommit).provision(command())
+			}
+			assertTrue(capture.events.isEmpty())
+		}
+	}
+
+	private fun serviceAt(
+		now: Instant,
+		transactionExecutor: TransactionExecutor = ImmediateTransactionExecutor,
+	) = UserProvisioningService(
 		userAccountRepository = accounts,
 		userAuthIdentityRepository = identities,
-		transactionExecutor = ImmediateTransactionExecutor,
+		transactionExecutor = transactionExecutor,
 		clock = Clock.fixed(now, ZoneId.of("UTC")),
 		defaultUserTimezone = ZoneId.of("Europe/Rome"),
 	)

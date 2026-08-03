@@ -4,7 +4,9 @@ import com.fitlake.food.application.UserFoodConflictException
 import com.fitlake.food.application.UserFoodNotFoundException
 import com.fitlake.food.application.UserFoodPersistenceException
 import com.fitlake.food.application.UserFoodValidationException
+import com.fitlake.shared.logging.sanitizedForTechnicalLogging
 import jakarta.validation.ConstraintViolationException
+import org.slf4j.LoggerFactory
 import org.springframework.core.Ordered
 import org.springframework.core.annotation.Order
 import org.springframework.dao.DataIntegrityViolationException
@@ -71,9 +73,21 @@ class UserFoodApiExceptionHandler {
 		response(HttpStatus.BAD_REQUEST, "invalid_request", "Request parameters are missing or invalid")
 
 	@ExceptionHandler(UserFoodPersistenceException::class)
-	fun persistenceFailure(): ResponseEntity<UserFoodApiError> =
-		response(HttpStatus.INTERNAL_SERVER_ERROR, "internal_server_error", "User food could not be persisted")
+	fun persistenceFailure(exception: UserFoodPersistenceException): ResponseEntity<UserFoodApiError> {
+		logger.atError()
+			.addKeyValue("event", "user_food_persistence_failed")
+			.addKeyValue("outcome", "failure")
+			.addKeyValue("errorCode", "USER_FOOD_PERSISTENCE_ERROR")
+			.addKeyValue("exceptionType", exception.javaClass.name)
+			.setCause(exception.sanitizedForTechnicalLogging())
+			.log("User food persistence failed")
+		return response(HttpStatus.INTERNAL_SERVER_ERROR, "internal_server_error", "User food could not be persisted")
+	}
 
 	private fun response(status: HttpStatus, error: String, message: String): ResponseEntity<UserFoodApiError> =
 		ResponseEntity.status(status).body(UserFoodApiError(error, message))
+
+	private companion object {
+		val logger = LoggerFactory.getLogger(UserFoodApiExceptionHandler::class.java)
+	}
 }

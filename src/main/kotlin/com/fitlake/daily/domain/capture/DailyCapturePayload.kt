@@ -25,21 +25,18 @@ data class MealItemDraft(
 		require(itemTempId.length <= 100) { "Food item reference must not exceed 100 characters" }
 		require(foodName.isNotBlank()) { "Food name must not be blank" }
 		require(foodName.length <= 255) { "Food name must not exceed 255 characters" }
-		require(quantity > BigDecimal.ZERO) { "Food quantity must be greater than zero" }
-		require(quantity <= BigDecimal("1000000")) { "Food quantity is outside the allowed range" }
+		requireDailyPositiveDecimal(quantity, "Food quantity")
 		require(unit in ALLOWED_UNITS) { "Unsupported food unit: $unit" }
-		require(calories.isNullOrInRange(BigDecimal("100000"))) { "Calories are outside the allowed range" }
-		require(proteinG.isNullOrInRange(MAX_MACRO_GRAMS)) { "Protein is outside the allowed range" }
-		require(carbsG.isNullOrInRange(MAX_MACRO_GRAMS)) { "Carbohydrates are outside the allowed range" }
-		require(fatG.isNullOrInRange(MAX_MACRO_GRAMS)) { "Fat is outside the allowed range" }
+		listOf(
+			"Calories" to calories,
+			"Protein" to proteinG,
+			"Carbohydrates" to carbsG,
+			"Fat" to fatG,
+		).forEach { (name, value) -> value?.let { requireDailyNonNegativeDecimal(it, name) } }
 	}
 
 	companion object {
 		val ALLOWED_UNITS = setOf("g", "kg", "ml", "l", "unit", "portion")
-		private val MAX_MACRO_GRAMS = BigDecimal("5000")
-
-		private fun BigDecimal?.isNullOrInRange(max: BigDecimal): Boolean =
-			this == null || (this >= BigDecimal.ZERO && this <= max)
 	}
 }
 
@@ -129,14 +126,14 @@ data class DailyCapturePayload(
 		require(note == null || note.length <= 10_000) { "Note is too long" }
 
 		when (type) {
-			DailyCaptureType.FOOD -> require(meals.isNotEmpty() && !fields.hasValues() && note == null) {
-				"FOOD payload requires meals only"
+			DailyCaptureType.FOOD -> require(meals.isNotEmpty() && !fields.hasValues()) {
+				"FOOD payload requires meals and may contain unresolved notes"
 			}
-			DailyCaptureType.DAILY_FIELDS -> require(meals.isEmpty() && fields.hasValues() && note == null) {
-				"DAILY_FIELDS payload requires at least one daily field"
+			DailyCaptureType.DAILY_FIELDS -> require(meals.isEmpty() && fields.hasValues()) {
+				"DAILY_FIELDS payload requires at least one daily field and may contain unresolved notes"
 			}
-			DailyCaptureType.MIXED -> require(meals.isNotEmpty() && fields.hasValues() && note == null) {
-				"MIXED payload requires both meals and daily fields"
+			DailyCaptureType.MIXED -> require(meals.isNotEmpty() && fields.hasValues()) {
+				"MIXED payload requires both meals and daily fields and may contain unresolved notes"
 			}
 			DailyCaptureType.NOTE -> require(meals.isEmpty() && !fields.hasValues() && note != null) {
 				"NOTE payload requires note text only"

@@ -1,5 +1,6 @@
 package com.fitlake.auth.infrastructure.firebase
 
+import com.fitlake.shared.application.elapsedMilliseconds
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseAuthException
 import org.slf4j.LoggerFactory
@@ -8,19 +9,14 @@ class FirebaseAdminTokenVerifier(
 	private val firebaseAuth: FirebaseAuth,
 ) : FirebaseTokenVerifier {
 	override fun verify(idToken: String): FirebaseTokenClaims {
+		val startedAtNanos = System.nanoTime()
 		if (idToken.isBlank()) {
-			logger.warn("Firebase ID token rejected: reason=blank_token")
+			logRejected("BLANK_TOKEN", startedAtNanos)
 			throw FirebaseTokenVerificationException()
 		}
 
 		return try {
 			val token = firebaseAuth.verifyIdToken(idToken, false)
-			logger.debug(
-				"Firebase ID token verified: issuer={}, emailPresent={}, emailVerified={}",
-				token.issuer,
-				token.email != null,
-				token.isEmailVerified,
-			)
 			FirebaseTokenClaims(
 				issuer = token.issuer,
 				subject = token.uid,
@@ -29,29 +25,26 @@ class FirebaseAdminTokenVerifier(
 				displayName = token.name,
 			)
 		} catch (exception: FirebaseAuthException) {
-			logger.warn(
-				"Firebase ID token rejected: authErrorCode={}, reason={}",
-				exception.authErrorCode?.name ?: "UNKNOWN",
-				safeReason(exception, idToken),
-			)
+			logRejected(exception.authErrorCode?.name ?: "UNKNOWN", startedAtNanos)
 			throw FirebaseTokenVerificationException(exception)
 		} catch (exception: IllegalArgumentException) {
-			logger.warn("Firebase ID token rejected: reason=malformed_token")
+			logRejected("MALFORMED_TOKEN", startedAtNanos)
 			throw FirebaseTokenVerificationException(exception)
 		}
 	}
 
-	private fun safeReason(exception: FirebaseAuthException, idToken: String): String =
-		exception.message
-			?.replace(idToken, REDACTED_TOKEN)
-			?.replace(Regex("[\\r\\n\\t]+"), " ")
-			?.take(MAX_LOG_REASON_LENGTH)
-			?.takeIf(String::isNotBlank)
-			?: "not_available"
+	private fun logRejected(errorCode: String, startedAtNanos: Long) {
+		logger.atWarn()
+			.addKeyValue("event", "auth_token_verification_failed")
+			.addKeyValue("outcome", "rejected")
+			.addKeyValue("authProvider", AUTH_PROVIDER)
+			.addKeyValue("errorCode", errorCode)
+			.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+			.log("Firebase token verification rejected")
+	}
 
 	companion object {
-		private const val REDACTED_TOKEN = "[REDACTED]"
-		private const val MAX_LOG_REASON_LENGTH = 500
+		private const val AUTH_PROVIDER = "firebase"
 		private val logger = LoggerFactory.getLogger(FirebaseAdminTokenVerifier::class.java)
 	}
 }

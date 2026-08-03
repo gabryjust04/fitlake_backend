@@ -1,5 +1,6 @@
 package com.fitlake.daily.application
 
+import ch.qos.logback.classic.Level
 import com.fitlake.daily.application.capture.DailyCaptureContentFactory
 import com.fitlake.daily.application.capture.DailyCaptureContentInput
 import com.fitlake.daily.application.capture.DailyCaptureEntryInput
@@ -8,6 +9,9 @@ import com.fitlake.daily.application.capture.DailyFoodItemInput
 import com.fitlake.daily.application.capture.DailyManualCaptureService
 import com.fitlake.daily.application.port.DailyOwnedUserFood
 import com.fitlake.daily.application.port.DailyUserFoodLookupPort
+import com.fitlake.daily.domain.audit.DailyCaptureAuditAction
+import com.fitlake.daily.domain.capture.DailyCapture
+import com.fitlake.daily.domain.capture.DailyCaptureActor
 import com.fitlake.daily.domain.capture.DailyCaptureEntry
 import com.fitlake.daily.domain.capture.DailyCaptureEntryType
 import com.fitlake.daily.domain.capture.DailyCapturePayload
@@ -31,6 +35,9 @@ import com.fitlake.support.InMemoryDailyCaptureAuditRepository
 import com.fitlake.support.InMemoryDailyCaptureRepository
 import com.fitlake.support.InMemoryDailyDayRepository
 import com.fitlake.support.InMemoryDailyMetricsRepository
+import com.fitlake.support.LogEventCapture
+import com.fitlake.support.renderedLogContent
+import com.fitlake.support.structuredFields
 import com.fitlake.user.domain.UserId
 import org.junit.jupiter.api.Test
 import java.math.BigDecimal
@@ -41,9 +48,11 @@ import java.time.ZoneOffset
 import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertSame
+import kotlin.test.assertTrue
 
 class DailyManualCaptureServiceTest {
 	private val userId = UserId(UUID.randomUUID())
@@ -102,6 +111,170 @@ class DailyManualCaptureServiceTest {
 		assertEquals(bd("105.4"), foodEntry.nutritionTotal?.caloriesKcal)
 		assertEquals(4L, item.userFoodSnapshot?.userFoodVersion)
 		assertEquals(1, captures.count())
+		val audit = audits.all().single()
+		assertEquals(DailyCaptureAuditAction.CREATE, audit.action)
+		assertEquals(DailyCaptureActor.USER_UI, audit.actor)
+		assertEquals(created.payload, audit.newPayload)
+		assertEquals(DailyCaptureStatus.OPEN, audit.newStatus)
+		assertEquals(created.version, audit.newVersion)
+	}
+
+	@Test
+	fun `manual create and replace logs contain lifecycle metadata without food health or payload data`() {
+		val privateFoodName = "PRIVATE_FOOD_NAME_9a51"
+		val privateCalories = "731.246"
+		val privateInitialWeight = "87654.321"
+		val privateReplacementWeight = "91234.567"
+		val foodId = foods.add(
+			userId,
+			food(name = privateFoodName, calories = privateCalories),
+		)
+		val initialInput = DailyCaptureContentInput(
+			listOf(
+				foodEntry(foodId, "137.249"),
+				DailyCaptureEntryInput(
+					entryId = null,
+					type = DailyCaptureEntryType.WEIGHT,
+					value = bd(privateInitialWeight),
+					unit = DailyScalarUnit.GRAM,
+				),
+			),
+		)
+
+		lateinit var created: DailyCapture
+		val createEvents = LogEventCapture(DailyManualCaptureService::class.java).use { logs ->
+			created = service.create(userId, date, initialInput)
+			logs.events
+		}
+		val createFields = createEvents
+			.single { it.structuredFields()["event"] == "daily_capture_created" }
+			.structuredFields()
+		assertEquals("success", createFields["outcome"])
+		assertEquals(userId.value, createFields["userRef"])
+		assertEquals(created.captureId.value, createFields["captureId"])
+		assertEquals(DailyCaptureType.MIXED, createFields["captureType"])
+		assertEquals(DailyCaptureStatus.OPEN, createFields["captureStatus"])
+		assertEquals(DailyCaptureActor.USER_UI, createFields["sourceType"])
+		assertEquals(2, createFields["entryCount"])
+		assertEquals(1, createFields["foodItemCount"])
+		assertEquals(created.version, createFields["newVersion"])
+		assertTrue(createFields["durationMs"] is Long)
+		assertFalse(createFields.containsKey("payload"))
+		assertFalse(createFields.containsKey("foodName"))
+		assertFalse(createFields.containsKey("bodyWeightKg"))
+		assertFalse(createFields.containsKey("nutrition"))
+		val createLogContent = createEvents.renderedLogContent()
+		listOf(
+			privateFoodName,
+			privateCalories,
+			privateInitialWeight,
+			"87.654321",
+			"137.249",
+			"Example Brand",
+		).forEach {
+			assertFalse(createLogContent.contains(it), "Private Daily content leaked in create log: $it")
+		}
+
+		val oldFoodEntry = created.payload.entries.single { it.type == DailyCaptureEntryType.FOOD }
+		val oldFoodItem = oldFoodEntry.items.single()
+		val oldWeightEntry = created.payload.entries.single { it.type == DailyCaptureEntryType.WEIGHT }
+		lateinit var replaced: DailyCapture
+		val replaceEvents = LogEventCapture(DailyManualCaptureService::class.java).use { logs ->
+			replaced = service.replace(
+				userId = userId,
+				captureId = created.captureId,
+				expectedVersion = created.version,
+				input = DailyCaptureContentInput(
+					listOf(
+						foodEntry(
+							foodId = foodId,
+							amount = "143.257",
+							entryId = oldFoodEntry.entryId,
+							itemId = oldFoodItem.itemId,
+						),
+						DailyCaptureEntryInput(
+							entryId = oldWeightEntry.entryId,
+							type = DailyCaptureEntryType.WEIGHT,
+							value = bd(privateReplacementWeight),
+							unit = DailyScalarUnit.GRAM,
+						),
+					),
+				),
+				requestId = "safe-request-id",
+			)
+			logs.events
+		}
+		val replaceFields = replaceEvents
+			.single { it.structuredFields()["event"] == "daily_capture_content_replaced" }
+			.structuredFields()
+		assertEquals("success", replaceFields["outcome"])
+		assertEquals(userId.value, replaceFields["userRef"])
+		assertEquals(created.captureId.value, replaceFields["captureId"])
+		assertEquals(DailyCaptureStatus.OPEN, replaceFields["oldStatus"])
+		assertEquals(DailyCaptureStatus.OPEN, replaceFields["newStatus"])
+		assertEquals(created.version, replaceFields["oldVersion"])
+		assertEquals(replaced.version, replaceFields["newVersion"])
+		assertEquals(2, replaceFields["entryCount"])
+		assertEquals(1, replaceFields["foodItemCount"])
+		assertTrue(replaceFields["durationMs"] is Long)
+		assertFalse(replaceFields.containsKey("payload"))
+		assertFalse(replaceFields.containsKey("foodName"))
+		assertFalse(replaceFields.containsKey("bodyWeightKg"))
+		assertFalse(replaceFields.containsKey("nutrition"))
+		val replaceLogContent = replaceEvents.renderedLogContent()
+		listOf(
+			privateFoodName,
+			privateCalories,
+			privateInitialWeight,
+			privateReplacementWeight,
+			"87.654321",
+			"91.234567",
+			"137.249",
+			"143.257",
+			"Example Brand",
+		).forEach {
+			assertFalse(replaceLogContent.contains(it), "Private Daily content leaked in replace log: $it")
+		}
+	}
+
+	@Test
+	fun `stale replacement logs a bounded version conflict without capture content`() {
+		val privateFoodName = "PRIVATE_CONFLICT_FOOD_19"
+		val privateAmount = "987.654"
+		val foodId = foods.add(userId, food(name = privateFoodName))
+		val created = service.create(
+			userId,
+			date,
+			DailyCaptureContentInput(listOf(foodEntry(foodId, "100"))),
+		)
+
+		val events = LogEventCapture(DailyManualCaptureService::class.java).use { logs ->
+			assertFailsWith<DailyConflictException> {
+				service.replace(
+					userId = userId,
+					captureId = created.captureId,
+					expectedVersion = created.version + 1,
+					input = DailyCaptureContentInput(listOf(foodEntry(foodId, privateAmount))),
+					requestId = "safe-conflict-request",
+				)
+			}
+			logs.events
+		}
+
+		val event = events.single { it.structuredFields()["event"] == "daily_capture_version_conflict" }
+		val fields = event.structuredFields()
+		assertEquals(Level.WARN, event.level)
+		assertEquals("rejected", fields["outcome"])
+		assertEquals("DAILY_CAPTURE_VERSION_CONFLICT", fields["errorCode"])
+		assertEquals(userId.value, fields["userRef"])
+		assertEquals(created.captureId.value, fields["captureId"])
+		assertEquals(created.version + 1, fields["expectedVersion"])
+		assertEquals(created.version, fields["actualVersion"])
+		assertTrue(fields["durationMs"] is Long)
+		assertFalse(fields.containsKey("payload"))
+		val rendered = events.renderedLogContent()
+		assertFalse(rendered.contains(privateFoodName))
+		assertFalse(rendered.contains(privateAmount))
 	}
 
 	@Test
@@ -130,6 +303,7 @@ class DailyManualCaptureServiceTest {
 			service.create(userId, date, DailyCaptureContentInput(listOf(foodEntry(foreignFoodId, "100"))))
 		}
 		assertEquals(0, captures.count())
+		assertEquals(0, audits.count())
 	}
 
 	@Test
@@ -166,7 +340,7 @@ class DailyManualCaptureServiceTest {
 		val changedItem = changedQuantity.payload.entries.single().items.single()
 		assertEquals(originalItem.userFoodSnapshot, changedItem.userFoodSnapshot)
 		assertEquals(bd("124.000000"), changedItem.calculatedNutrition.caloriesKcal)
-		assertEquals(2, audits.count())
+		assertEquals(3, audits.count())
 		assertEquals(created.version, audits.all().single { it.requestId == "request-1" }.oldVersion)
 		assertEquals(changedQuantity.version, audits.all().single { it.requestId == "request-2" }.newVersion)
 	}
@@ -326,7 +500,7 @@ class DailyManualCaptureServiceTest {
 	}
 
 	@Test
-	fun `typed content rejects new changed-source and quantity-mutated AI estimates`() {
+	fun `typed content lets an AI estimate become an exact user food but rejects client-authored estimates`() {
 		val existingEstimate = aiEstimatePayload()
 		val estimateEntry = existingEstimate.entries.single()
 		val estimateItem = estimateEntry.items.single()
@@ -376,6 +550,35 @@ class DailyManualCaptureServiceTest {
 				),
 			)
 		}
+
+		val converted = contentFactory.replace(
+			userId,
+			existingEstimate,
+			DailyCaptureContentInput(
+				listOf(
+					DailyCaptureEntryInput(
+						estimateEntry.entryId,
+						DailyCaptureEntryType.FOOD,
+						items = listOf(
+							DailyFoodItemInput(
+								itemId = estimateItem.itemId,
+								sourceType = DailyFoodItemSourceType.USER_FOOD,
+								userFoodId = foodId,
+								quantity = DailyEnteredFoodQuantityInput(
+									estimateItem.enteredQuantity.amount,
+									estimateItem.enteredQuantity.unit,
+								),
+							),
+						),
+					),
+				),
+			),
+		)
+		val convertedItem = converted.entries.single().items.single()
+		assertEquals(estimateItem.itemId, convertedItem.itemId)
+		assertEquals(DailyFoodItemSourceType.USER_FOOD, convertedItem.sourceType)
+		assertEquals(foodId, convertedItem.userFoodId)
+		assertNotNull(convertedItem.userFoodSnapshot)
 
 		assertFailsWith<DailyValidationException> {
 			contentFactory.replace(

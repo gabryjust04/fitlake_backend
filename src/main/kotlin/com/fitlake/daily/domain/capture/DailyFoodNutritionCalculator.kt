@@ -20,13 +20,32 @@ class DailyFoodNutritionCalculator {
 	fun calculate(
 		enteredQuantity: DailyEnteredQuantity,
 		snapshot: DailyUserFoodSnapshot,
+	): DailyFoodCalculation = calculate(
+		enteredQuantity = enteredQuantity,
+		nutritionBasis = snapshot.nutritionBasis,
+		nutrientsPerBasis = snapshot.nutrientsPerBasis,
+		defaultServing = snapshot.defaultServing,
+		conversions = snapshot.conversions,
+	)
+
+	/**
+	 * Scales nutrition from an explicit basis. This is also used for AI estimates:
+	 * the provider proposes a basis, while the backend remains authoritative for
+	 * unit conversion, scaling and rounding.
+	 */
+	fun calculate(
+		enteredQuantity: DailyEnteredQuantity,
+		nutritionBasis: DailyFoodBasisSnapshot,
+		nutrientsPerBasis: DailyNutritionValues,
+		defaultServing: DailyFoodDefaultServingSnapshot? = null,
+		conversions: DailyFoodConversionSnapshot = DailyFoodConversionSnapshot(),
 	): DailyFoodCalculation {
-		val basis = snapshot.nutritionBasis.toCanonicalQuantity()
-		val entered = enteredQuantity.resolveDefaultServing(snapshot.defaultServing).toCanonicalQuantity()
+		val basis = nutritionBasis.toCanonicalQuantity()
+		val entered = enteredQuantity.resolveDefaultServing(defaultServing).toCanonicalQuantity()
 		val resolvedAmount = convertToBasisDimension(
 			quantity = entered,
 			basis = basis,
-			conversions = snapshot.conversions,
+			conversions = conversions,
 		)
 		val factor = divideWithInternalPrecision(resolvedAmount, basis.amount, "Nutrition calculation factor")
 		if (factor > MAX_CALCULATION_FACTOR) {
@@ -38,7 +57,7 @@ class DailyFoodNutritionCalculator {
 				amount = resolvedAmount.roundedForDaily("Resolved quantity"),
 				unit = basis.unit.toResolvedUnit(),
 			),
-			calculatedNutrition = snapshot.nutrientsPerBasis.scaledBy(factor),
+			calculatedNutrition = nutrientsPerBasis.scaledBy(factor),
 		)
 	}
 
@@ -75,15 +94,16 @@ class DailyFoodNutritionCalculator {
 
 	private fun DailyEnteredQuantity.resolveDefaultServing(
 		defaultServing: DailyFoodDefaultServingSnapshot?,
-	): SnapshotQuantity = if (unit == DailyFoodQuantityUnit.DEFAULT_SERVING) {
-		val serving = defaultServing
-			?: throw DailyFoodCalculationException("Default serving is not defined for this user food")
-		SnapshotQuantity(
-			amount = multiplyWithInternalPrecision(amount, serving.amount, "Resolved default serving quantity"),
-			unit = serving.unit,
-		)
-	} else {
-		SnapshotQuantity(amount, unit.toSnapshotUnit())
+	): SnapshotQuantity {
+		if (unit == DailyFoodQuantityUnit.DEFAULT_SERVING || unit == DailyFoodQuantityUnit.SERVING && defaultServing != null) {
+			val serving = defaultServing
+				?: throw DailyFoodCalculationException("Default serving is not defined for this user food")
+			return SnapshotQuantity(
+				amount = multiplyWithInternalPrecision(amount, serving.amount, "Resolved default serving quantity"),
+				unit = serving.unit,
+			)
+		}
+		return SnapshotQuantity(amount, unit.toSnapshotUnit())
 	}
 
 	private fun SnapshotQuantity.toCanonicalQuantity(): CanonicalQuantity = when (unit) {

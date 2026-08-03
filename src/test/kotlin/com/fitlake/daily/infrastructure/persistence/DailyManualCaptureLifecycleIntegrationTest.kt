@@ -16,6 +16,7 @@ import com.fitlake.daily.application.port.DailyCaptureAuditRepository
 import com.fitlake.daily.application.port.DailyCaptureRepository
 import com.fitlake.daily.application.port.DailyDayRepository
 import com.fitlake.daily.application.port.DailyMetricsRepository
+import com.fitlake.daily.domain.audit.DailyCaptureAuditAction
 import com.fitlake.daily.domain.capture.DailyCaptureEntryType
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.daily.domain.capture.DailyFoodItemSourceType
@@ -127,6 +128,7 @@ class DailyManualCaptureLifecycleIntegrationTest @Autowired constructor(
 	private val confirmationService = CaptureConfirmationService(
 		dayRepository = days,
 		captureRepository = captures,
+		auditRepository = audits,
 		captureService = captureService,
 		transactionExecutor = transactions,
 		clock = clock,
@@ -200,7 +202,16 @@ class DailyManualCaptureLifecycleIntegrationTest @Autowired constructor(
 		assertEquals(DailyCaptureStatus.ACCEPTED, edited.status)
 		assertTrue(edited.version > accepted.version)
 		assertDecimal("93.000000", edited.payload.entries.single().items.single().calculatedNutrition.caloriesKcal)
-		assertEquals(1, audits.findAllByCaptureIdAndUserId(edited.captureId, userId).size)
+		val captureAudits = audits.findAllByCaptureIdAndUserId(edited.captureId, userId)
+		assertEquals(3, captureAudits.size)
+		assertEquals(
+			setOf(
+				DailyCaptureAuditAction.CREATE,
+				DailyCaptureAuditAction.ACCEPT,
+				DailyCaptureAuditAction.UI_EDIT,
+			),
+			captureAudits.map { it.action }.toSet(),
+		)
 
 		val finalized = finalizationService.finalizeDay(userId, date)
 		val persistedMetrics = assertNotNull(metrics.findByDayId(finalized.dayId))

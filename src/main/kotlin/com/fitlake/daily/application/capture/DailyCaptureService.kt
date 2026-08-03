@@ -24,7 +24,11 @@ class DailyCaptureService(
 	private val transactionExecutor: TransactionExecutor,
 	private val clock: Clock,
 ) {
-	fun createFromUser(userId: UserId, date: LocalDate, payload: DailyCapturePayload): DailyCapture = try {
+	/**
+	 * Internal construction primitive retained for module tests and orchestration.
+	 * Manual channels must use [DailyManualCaptureService] so typed content is resolved and validated first.
+	 */
+	internal fun createFromUser(userId: UserId, date: LocalDate, payload: DailyCapturePayload): DailyCapture = try {
 		transactionExecutor.required { createUserCaptureOnce(userId, date, payload) }
 	} catch (exception: DailyConcurrentCreationException) {
 		transactionExecutor.required { createUserCaptureOnce(userId, date, payload) }

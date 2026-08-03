@@ -1,6 +1,8 @@
 package com.fitlake.daily.infrastructure.persistence.entity
 
 import com.fitlake.daily.domain.audit.DailyCaptureAuditAction
+import com.fitlake.daily.domain.capture.DailyCaptureActor
+import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import jakarta.persistence.Column
 import jakarta.persistence.Entity
 import jakarta.persistence.EnumType
@@ -31,19 +33,37 @@ class DailyCaptureAuditEntity(
 	@Column(name = "action", nullable = false, length = 30, updatable = false)
 	var action: DailyCaptureAuditAction,
 
-	@JdbcTypeCode(SqlTypes.JSON)
-	@Column(name = "old_payload", nullable = false, updatable = false, columnDefinition = "jsonb")
-	var oldPayload: Map<String, Any?>,
+	@Enumerated(EnumType.STRING)
+	@Column(name = "actor", nullable = false, length = 20, updatable = false)
+	var actor: DailyCaptureActor,
 
 	@JdbcTypeCode(SqlTypes.JSON)
-	@Column(name = "new_payload", nullable = false, updatable = false, columnDefinition = "jsonb")
-	var newPayload: Map<String, Any?>,
+	@Column(name = "old_payload", updatable = false, columnDefinition = "jsonb")
+	var oldPayload: Map<String, Any?>?,
 
-	@Column(name = "old_version", nullable = false, updatable = false)
-	var oldVersion: Long,
+	@JdbcTypeCode(SqlTypes.JSON)
+	@Column(name = "new_payload", updatable = false, columnDefinition = "jsonb")
+	var newPayload: Map<String, Any?>?,
 
-	@Column(name = "new_version", nullable = false, updatable = false)
-	var newVersion: Long,
+	@Enumerated(EnumType.STRING)
+	@Column(name = "old_status", length = 20, updatable = false)
+	var oldStatus: DailyCaptureStatus?,
+
+	@Enumerated(EnumType.STRING)
+	@Column(name = "new_status", length = 20, updatable = false)
+	var newStatus: DailyCaptureStatus?,
+
+	@Column(name = "old_version", updatable = false)
+	var oldVersion: Long?,
+
+	@Column(name = "new_version", updatable = false)
+	var newVersion: Long?,
+
+	@Column(name = "reason_code", length = 100, updatable = false)
+	var reasonCode: String?,
+
+	@Column(name = "related_capture_id", updatable = false)
+	var relatedCaptureId: UUID?,
 
 	@Column(name = "request_id", length = 100, updatable = false)
 	var requestId: String?,

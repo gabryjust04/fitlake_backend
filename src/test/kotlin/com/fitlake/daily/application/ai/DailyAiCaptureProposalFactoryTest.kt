@@ -2,6 +2,7 @@ package com.fitlake.daily.application.ai
 
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchPort
 import com.fitlake.daily.application.port.DailyAiUserFoodMatchResult
+import com.fitlake.daily.application.port.DailyAiFoodMatchType
 import com.fitlake.daily.application.port.DailyOwnedUserFood
 import com.fitlake.daily.domain.capture.DailyCaptureEntryType
 import com.fitlake.daily.domain.capture.DailyCaptureType
@@ -73,15 +74,23 @@ class DailyAiCaptureProposalFactoryTest {
 			),
 			result.nutritionResolutions.map(DailyAiNutritionResolution::outcome),
 		)
-		assertNutrition("999", "99", "99", "99", result.nutritionResolutions[0].aiEstimate)
-		assertNutrition("200", "5", "30", "4", result.nutritionResolutions[0].finalNutrition)
 		assertEquals(listOf("oats", "apple"), matcher.calls.map(FakeMatcher.Call::extractedName))
 	}
 
 	@Test
 	fun `ambiguous catalog result falls back to the complete AI estimate`() {
 		val matcher = FakeMatcher().apply {
-			returns(userId, "rice", DailyAiUserFoodMatchResult.Ambiguous)
+			returns(
+				userId,
+				"rice",
+				DailyAiUserFoodMatchResult.Ambiguous(
+					reason = "MATCH_MARGIN_TOO_SMALL",
+					bestMatchedBy = DailyAiFoodMatchType.FUZZY_NAME,
+					bestScore = 0.81,
+					runnerUpScore = 0.80,
+					candidateCount = 2,
+				),
+			)
 		}
 
 		val result = DailyAiCaptureProposalFactory(matcher).create(
@@ -95,7 +104,12 @@ class DailyAiCaptureProposalFactoryTest {
 		val resolution = result.nutritionResolutions.single()
 		assertEquals(DailyAiNutritionResolutionOutcome.AMBIGUOUS_MATCH, resolution.outcome)
 		assertNull(resolution.userFoodId)
-		assertNutrition("104.5", "2.1", "22.7", "0.3", resolution.finalNutrition)
+		assertEquals(DailyAiFoodMatchType.FUZZY_NAME, resolution.matchedBy)
+		assertEquals(0.81, resolution.matchScore)
+		assertEquals(0.80, resolution.runnerUpScore)
+		assertEquals(2, resolution.candidateCount)
+		assertEquals("MATCH_MARGIN_TOO_SMALL", resolution.matchReason)
+		assertEquals(0.81, resolution.toAuditMap()["matchScore"])
 	}
 
 	@Test
@@ -177,13 +191,93 @@ class DailyAiCaptureProposalFactoryTest {
 	}
 
 	@Test
+	fun `incompatible mandatory estimate is rejected even when a catalog match could satisfy the stated quantity`() {
+		val matcher = FakeMatcher().apply {
+			returns(
+				userId,
+				"oats",
+				DailyAiUserFoodMatchResult.Unique(
+					food(name = "Catalog oats", nutrients = nutrition("370", "13", "60", "7")),
+				),
+			)
+		}
+		val interpretation = foodProposal(
+			listOf(
+				AiFoodInterpretation(
+					originalFragment = "oats",
+					searchText = "oats",
+					statedQuantity = AiFoodQuantity(bd("40"), "g"),
+					estimatedQuantity = AiFoodQuantity(bd("1"), "unit"),
+					nutritionEstimate = AiNutritionEstimate(
+						basis = AiFoodQuantity(bd("100"), "g"),
+						caloriesKcal = bd("370"),
+						proteinGrams = bd("13"),
+						carbohydratesGrams = bd("60"),
+						fatGrams = bd("7"),
+					),
+				),
+			),
+		)
+
+		assertFailsWith<DailyAiInvalidOutputException> {
+			DailyAiCaptureProposalFactory(matcher).create(userId, "oats", interpretation)
+		}
+		assertEquals(emptyList(), matcher.calls)
+	}
+
+	@Test
+	fun `daily notes preserve the exact model fragment without trimming`() {
+		val exactNote = "  mi sento molto bene  "
+		val result = DailyAiCaptureProposalFactory(FakeMatcher()).create(
+			userId = userId,
+			rawText = "Nota:$exactNote",
+			interpretation = DailyMessageInterpretation(
+				outcome = DailyMessageInterpretationOutcome.COMPLETE,
+				fields = listOf(
+					AiDailyFieldInterpretation(
+						field = AiDailyFieldType.DAILY_NOTES,
+						textValue = exactNote,
+						originalFragment = exactNote,
+					),
+				),
+			),
+		)
+
+		assertEquals(exactNote, result.payload.entries.single().text)
+		assertFailsWith<DailyAiInvalidOutputException> {
+			DailyAiCaptureProposalFactory(FakeMatcher()).create(
+				userId = userId,
+				rawText = "Nota:$exactNote",
+				interpretation = DailyMessageInterpretation(
+					outcome = DailyMessageInterpretationOutcome.COMPLETE,
+					fields = listOf(
+						AiDailyFieldInterpretation(
+							field = AiDailyFieldType.DAILY_NOTES,
+							textValue = "testo inventato",
+							originalFragment = exactNote,
+						),
+					),
+				),
+			)
+		}
+	}
+
+	@Test
 	fun `food plus weight derives one mixed payload`() {
 		val result = DailyAiCaptureProposalFactory(FakeMatcher()).create(
 			userId,
-			AiCaptureProposal(
-				type = "MIXED",
-				meals = listOf(AiMealProposal("breakfast", listOf(item("banana", "1", "unit", "105", "1.3", "27", "0.4")))),
-				fields = AiDailyFieldsProposal(bodyWeightKg = bd("78.4")),
+			DailyMessageInterpretation(
+				outcome = DailyMessageInterpretationOutcome.COMPLETE,
+				meals = listOf(
+					AiMealInterpretation("breakfast", listOf(item("banana", "1", "unit", "105", "1.3", "27", "0.4"))),
+				),
+				fields = listOf(
+					AiDailyFieldInterpretation(
+						field = AiDailyFieldType.BODY_WEIGHT_KG,
+						numericValue = bd("78.4"),
+						originalFragment = "78.4",
+					),
+				),
 			),
 		)
 
@@ -208,14 +302,21 @@ class DailyAiCaptureProposalFactoryTest {
 		val factory = DailyAiCaptureProposalFactory(FakeMatcher())
 		val fields = factory.create(
 			userId,
-			AiCaptureProposal(
-				type = "DAILY_FIELDS",
-				fields = AiDailyFieldsProposal(sleepHours = bd("7.5")),
+			DailyMessageInterpretation(
+				outcome = DailyMessageInterpretationOutcome.COMPLETE,
+				fields = listOf(
+					AiDailyFieldInterpretation(
+						field = AiDailyFieldType.SLEEP_HOURS,
+						numericValue = bd("7.5"),
+						originalFragment = "7.5",
+					),
+				),
 			),
 		)
 		val note = factory.create(
-			userId,
-			AiCaptureProposal(type = "NOTE", note = "Giornata tranquilla"),
+			userId = userId,
+			rawText = "Giornata tranquilla",
+			interpretation = DailyMessageInterpretation(DailyMessageInterpretationOutcome.UNRESOLVED),
 		)
 
 		assertEquals(DAILY_CAPTURE_SCHEMA_VERSION, fields.payload.schemaVersion)
@@ -228,7 +329,7 @@ class DailyAiCaptureProposalFactoryTest {
 	}
 
 	@Test
-	fun `portion prefers the catalog default serving when one is available`() {
+	fun `explicit portion is preserved while catalog default serving resolves its nutrition`() {
 		val matcher = FakeMatcher()
 		val yogurt = food(
 			name = "Large yogurt",
@@ -244,7 +345,7 @@ class DailyAiCaptureProposalFactoryTest {
 
 		val foodItem = result.payload.entries.single().items.single()
 		assertEquals(DailyFoodItemSourceType.USER_FOOD, foodItem.sourceType)
-		assertEquals(DailyFoodQuantityUnit.DEFAULT_SERVING, foodItem.enteredQuantity.unit)
+		assertEquals(DailyFoodQuantityUnit.SERVING, foodItem.enteredQuantity.unit)
 		assertDecimal("2", foodItem.enteredQuantity.amount)
 		assertEquals(DailyResolvedFoodUnit.GRAM, foodItem.resolvedQuantity.unit)
 		assertDecimal("500", foodItem.resolvedQuantity.amount)
@@ -252,9 +353,9 @@ class DailyAiCaptureProposalFactoryTest {
 		assertEquals(DailyAiNutritionResolutionOutcome.CATALOG_MATCH, result.nutritionResolutions.single().outcome)
 	}
 
-	private fun foodProposal(items: List<AiFoodItemProposal>) = AiCaptureProposal(
-		type = "FOOD",
-		meals = listOf(AiMealProposal(mealName = "meal", items = items)),
+	private fun foodProposal(items: List<AiFoodInterpretation>) = DailyMessageInterpretation(
+		outcome = DailyMessageInterpretationOutcome.COMPLETE,
+		meals = listOf(AiMealInterpretation(mealName = "meal", items = items)),
 	)
 
 	private fun item(
@@ -265,15 +366,30 @@ class DailyAiCaptureProposalFactoryTest {
 		protein: String,
 		carbs: String,
 		fat: String,
-	) = AiFoodItemProposal(
-		foodName = name,
-		quantity = bd(quantity),
-		unit = unit,
-		calories = bd(calories),
-		proteinG = bd(protein),
-		carbsG = bd(carbs),
-		fatG = bd(fat),
+	) = AiFoodInterpretation(
+		originalFragment = name,
+		searchText = name,
+		statedQuantity = AiFoodQuantity(bd(quantity), unit),
+		estimatedQuantity = AiFoodQuantity(bd(quantity), unit),
+		nutritionEstimate = AiNutritionEstimate(
+			basis = AiFoodQuantity(bd(quantity), unit),
+			caloriesKcal = bd(calories),
+			proteinGrams = bd(protein),
+			carbohydratesGrams = bd(carbs),
+			fatGrams = bd(fat),
+		),
 	)
+
+	private fun DailyAiCaptureProposalFactory.create(
+		userId: UserId,
+		interpretation: DailyMessageInterpretation,
+	): DailyAiCaptureBuildResult {
+		val fragments = buildList {
+			interpretation.meals.flatMap(AiMealInterpretation::items).map(AiFoodInterpretation::originalFragment).forEach(::add)
+			interpretation.fields.map(AiDailyFieldInterpretation::originalFragment).forEach(::add)
+		}
+		return create(userId, fragments.joinToString(" e "), interpretation)
+	}
 
 	private fun food(
 		id: UUID = UUID.randomUUID(),
@@ -336,9 +452,9 @@ class DailyAiCaptureProposalFactoryTest {
 			answers[userId to extractedName] = result
 		}
 
-		override fun match(userId: UserId, extractedName: String): DailyAiUserFoodMatchResult {
-			calls += Call(userId, extractedName)
-			return answers[userId to extractedName] ?: DailyAiUserFoodMatchResult.None
+		override fun match(userId: UserId, searchText: String): DailyAiUserFoodMatchResult {
+			calls += Call(userId, searchText)
+			return answers[userId to searchText] ?: DailyAiUserFoodMatchResult.None
 		}
 	}
 }

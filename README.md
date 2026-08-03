@@ -1,13 +1,13 @@
 # FitLake API
 
-FitLake is a Spring Boot/Kotlin modular monolith for personal daily tracking. The current implementation contains Firebase Authentication, the authenticated Daily REST slice, standalone natural-language insertion through Spring AI tool calling, and a private user-managed food catalog. Telegram is not implemented yet.
+FitLake is a Spring Boot/Kotlin modular monolith for personal daily tracking. The current implementation contains Firebase Authentication, the authenticated Daily REST slice, standalone natural-language insertion through a pure Spring AI structured interpreter, and a private user-managed food catalog. Telegram is not implemented yet.
 
 ## Requirements
 
 - JDK 25
 - PostgreSQL 16 or compatible
 - A Firebase project with Firebase Authentication enabled
-- An OpenAI-compatible chat model with tool/function-calling support for AI insertion
+- An OpenAI-compatible chat model that can reliably return JSON for AI insertion; native JSON Schema response-format support is optional
 - Docker only if you want to run PostgreSQL locally or execute the Testcontainers integration tests
 
 The application does not start Docker or Docker Compose automatically.
@@ -55,7 +55,7 @@ docker run --name fitlake-postgres `
   -d postgres:16-alpine
 ```
 
-Flyway runs automatically at application startup. `V1__initialize_fitlake_daily_schema.sql` creates the seven original Daily tables, `V2__add_firebase_auth_identity.sql` adds `user_auth_identity`, `V3__add_daily_ai_message_audit.sql` adds the AI reprocess link, processing lease, and database idempotency constraints, `V4__add_private_user_food_catalog.sql` adds `user_food`, `user_food_alias`, and their search indexes, and `V5__add_daily_capture_content_audit.sql` adds owner-safe capture audit rows and changes finalized calories to `NUMERIC(18,6)`. Hibernate only validates the migrated schema (`ddl-auto=validate`).
+Flyway runs automatically at application startup. `V1__initialize_fitlake_daily_schema.sql` creates the seven original Daily tables, `V2__add_firebase_auth_identity.sql` adds `user_auth_identity`, `V3__add_daily_ai_message_audit.sql` adds the AI reprocess link, processing lease, and database idempotency constraints, `V4__add_private_user_food_catalog.sql` adds `user_food`, `user_food_alias`, and their search indexes, `V5__add_daily_capture_content_audit.sql` adds owner-safe capture audit rows and changes finalized calories to `NUMERIC(18,6)`, `V6__expand_daily_capture_lifecycle_audit.sql` updates AI terminal statuses and records capture creation, state transitions, deletion, and reprocess replacement, and `V7__enforce_daily_tenant_references.sql` adds composite owner foreign keys across days, inbox events, captures, AI logs, and metrics. Hibernate only validates the migrated schema (`ddl-auto=validate`).
 
 V4 enables PostgreSQL's `pg_trgm` extension with `CREATE EXTENSION IF NOT EXISTS pg_trgm`. The PostgreSQL installation must provide that extension and the migration role must be allowed to enable it. The official PostgreSQL Docker images used by local development and Testcontainers include it.
 
@@ -76,6 +76,8 @@ The backend expects a Firebase **ID token issued to the signed-in client**, not 
 `.env.example` documents the available variables, but Spring Boot does not load `.env` files automatically. For a PowerShell session:
 
 ```powershell
+$env:SPRING_PROFILES_ACTIVE='dev'
+
 $env:DATABASE_URL='jdbc:postgresql://localhost:5432/fitlake'
 $env:DATABASE_USERNAME='postgres'
 $env:DATABASE_PASSWORD='change-me'
@@ -90,9 +92,15 @@ $env:SPRING_AI_OPENAI_BASE_URL='https://openrouter.ai/api/v1'
 $env:SPRING_AI_OPENAI_CHAT_MODEL='your-openrouter-model'
 $env:SPRING_AI_OPENAI_CHAT_MAX_TOKENS='4096'
 $env:FITLAKE_DAILY_AI_MAX_TEXT_LENGTH='4000'
+$env:FITLAKE_DAILY_AI_MAX_STRUCTURED_OUTPUT_RETRIES='1'
+$env:FITLAKE_DAILY_AI_NATIVE_STRUCTURED_OUTPUT_ENABLED='false'
+$env:FITLAKE_DAILY_AI_FOOD_MATCH_MINIMUM_SCORE='0.78'
+$env:FITLAKE_DAILY_AI_FOOD_MATCH_MINIMUM_MARGIN='0.12'
 ```
 
-`OPENAI_API_KEY` is the Spring AI OpenAI-compatible provider credential. It may be an OpenRouter key when the base URL points to OpenRouter; it does not have to be issued by OpenAI. The selected model must support tool calling. `SPRING_AI_OPENAI_CHAT_MAX_TOKENS` caps each structured response and defaults to `4096`, preventing providers from reserving the model's much larger maximum output context. AI is disabled by default (`SPRING_AI_MODEL_CHAT=none`), so the rest of the API can start without an AI key; AI endpoints then return a safe `503`.
+`OPENAI_API_KEY` is the Spring AI OpenAI-compatible provider credential. It may be an OpenRouter key when the base URL points to OpenRouter; it does not have to be issued by OpenAI. Tool calling is not used. `SPRING_AI_OPENAI_CHAT_MAX_TOKENS` caps each response at `4096` by default. Invalid structured output is retried once by default; the configured retry count must be between `0` and `3`.
+
+The v3 response schema is always included in the system prompt and every response is parsed and validated by the backend. `FITLAKE_DAILY_AI_NATIVE_STRUCTURED_OUTPUT_ENABLED=true` additionally sends the provider-native `response_format=json_schema`; leave it `false` for the currently used OpenRouter model, which does not support that option, and enable it only when the selected provider/model explicitly advertises support. The food-match score and margin settings govern conservative automatic prefix/fuzzy matches. AI is disabled by default (`SPRING_AI_MODEL_CHAT=none`), so the rest of the API can start without an AI key; AI endpoints then return a safe `503`.
 
 ## Run
 
@@ -254,7 +262,7 @@ Deletion sets `deleted_at` and returns `204`; the food and its aliases then disa
 
 Invalid definitions and query parameters return `400`, inaccessible foods return `404`, and active barcode or alias conflicts return `409`, using the API's standard safe error body.
 
-The catalog participates in two read-only Daily paths. Manual typed input uses the exact, ownership-scoped `userFoodId` selected by the frontend; it never matches by name. Natural-language AI insertion may ask the backend to resolve the extracted food name against the authenticated user's active catalog, but only an exact normalized name or alias that identifies one food is accepted automatically. Prefix and fuzzy results are never used by the AI path. Neither path creates or updates catalog definitions.
+The catalog participates in two read-only Daily paths. Manual typed input uses the exact, ownership-scoped `userFoodId` selected by the frontend; it never matches by name. Natural-language AI insertion submits the extracted `searchText` to the same user-scoped ranked catalog search used by the UI, then applies a stricter policy: one exact match wins; otherwise a prefix/fuzzy candidate is accepted only when its score meets the configured minimum and, when another candidate exists, its lead does too. Approximate matching is also rejected when the bounded 50-candidate window may be truncated, because the backend cannot prove the required margin. Weak, tied, truncated, foreign, or deleted candidates are never accepted. Neither path creates or updates catalog definitions.
 
 Each matched consumed item stores its `userFoodId` and an immutable snapshot of the food definition used for calculation. Later edits or soft deletion of the reusable catalog definition never rewrite or break an existing capture.
 
@@ -348,7 +356,7 @@ curl.exe -X PUT "http://localhost:8080/api/daily/captures/<CAPTURE_ID>" `
 
 The `entries` array is the entire new editable content: omitted entries and items are removed. Existing entry/item UUIDs must already belong to this target capture; omitted UUIDs are generated by the backend. An unchanged linked item preserves its original snapshot. A quantity-only edit recalculates from that same snapshot, even if the catalog food has since changed or been deleted. A new item or changed `userFoodId` loads the current active owned definition and creates a new snapshot; a deleted/foreign food is ownership-safely `404`.
 
-An existing `AI_ESTIMATE` item has stricter replacement rules. The full `PUT` may preserve it unchanged by resending its existing item ID, `AI_ESTIMATE` source, and original quantity, or remove it by omission. The client cannot create a new `AI_ESTIMATE`, change its quantity or nutrition, or change its source. To correct an estimated item, submit complete replacement text through the AI reprocess endpoint.
+An existing `AI_ESTIMATE` item has stricter replacement rules. The full `PUT` may preserve it unchanged by resending its existing item ID, `AI_ESTIMATE` source, and original quantity; remove it by omission; or replace it with an exact active `USER_FOOD` reference while preserving the logical item ID. That last operation loads the currently owned catalog definition, calculates authoritative nutrition, and creates a new snapshot. The client cannot create a new `AI_ESTIMATE` or directly change its estimated quantity or nutrition. Complete-text AI reprocess remains available when the natural-language interpretation itself must be regenerated.
 
 `PUT /api/daily/captures/{captureId}` is the only capture-update endpoint. It uses one transaction for validation, scoped food resolution, calculation, payload persistence, version increment, and a `UI_EDIT` audit row containing old/new payloads and versions. A stale version returns `409` and changes nothing. `OPEN` remains `OPEN`; `ACCEPTED` remains `ACCEPTED`. Rejected, soft-deleted, expired, and captures on a `CONFIRMED` day cannot be edited. After a day is `REOPENED`, its accepted captures are editable and the next finalization recalculates the metrics snapshot.
 
@@ -382,27 +390,38 @@ Finalization reads every accepted capture. It concatenates food logs; sums calor
 
 ## Daily AI insertion
 
-The AI endpoint receives text, not the structured manual-capture JSON. The model must choose exactly one terminal tool:
+The AI endpoint receives `{ "text": "..." }`, not manual-capture JSON. `CaptureInterpreterPort` is a pure outbound application port: it sends the standalone message to the configured model and returns a `DailyMessageInterpretation`. It has no repositories, catalog access, terminal service, persistence callback, or model-callable tools. The backend alone supplies the authenticated user, date, day, IDs, ownership, `OPEN` status, and timestamps. The active prompt is [`daily-capture-v3.txt`](src/main/resources/prompts/daily-capture-v3.txt).
 
-```text
-createCapture
-askClarification
-noOp
-```
+The model returns exactly one structured interpretation with one semantic outcome:
 
-Only `createCapture` reaches the normal application capture use case. The authenticated user, date, day, IDs, ownership, `OPEN` status, and timestamps always come from the backend. The model cannot call repositories, inspect the catalog, or write to PostgreSQL. The active versioned prompt is `src/main/resources/prompts/daily-capture-v2.txt`.
+- `COMPLETE`: at least one Daily fact was structured and no source fragment remains unresolved.
+- `PARTIAL`: structured facts plus one or more unresolved fragments copied verbatim from the input. Each unresolved fragment becomes a `NOTE` entry in the same proposal.
+- `UNRESOLVED`: the text is relevant but no fact can be safely structured. The backend preserves the complete original text as one `NOTE` entry.
+- `NO_RELEVANT_DATA`: the text contains no Daily fact; the endpoint returns `200` without creating a capture.
 
-For every extracted food item, the model must return `calories`, `proteinG`, `carbsG`, and `fatG` as non-negative decimal estimates for the complete consumed quantity. These four values are mandatory even when a personal-food match is likely because they are the backend fallback.
+There is no clarification outcome and no no-op tool. `COMPLETE`, `PARTIAL`, and `UNRESOLVED` all create an ordinary `OPEN` proposal that still requires user confirmation. Food and field `originalFragment` values, unresolved fragments, and Daily-note text must occur verbatim in the submitted text; unknown properties, model-generated backend fields, inconsistent outcomes, invalid ranges, and paraphrased fragments are rejected.
 
-The backend then resolves each item independently:
+For every extracted food, the model must always return:
 
-1. Normalize the extracted name and look only for exact active name or alias matches owned by the authenticated user.
-2. If exactly one food matches, all four core catalog nutrients are present, and the entered unit can be converted deterministically, calculate from the immutable catalog snapshot and store the item as `USER_FOOD`. These calculated values replace the AI estimate.
-3. If there is no exact match, more than one exact match, incomplete core catalog nutrition, or no valid unit conversion, store the complete model-provided quartet as `AI_ESTIMATE`.
+- `searchText` for backend catalog lookup;
+- optional `statedQuantity` only when the user supplied it;
+- mandatory `estimatedQuantity` for the complete consumed amount;
+- mandatory `nutritionEstimate.basis` and non-negative calories, protein, carbohydrates, and fat for that explicit basis, plus any optional nutrients it can estimate.
 
-The backend never combines individual nutrients from the catalog and AI in one item, never coerces a missing catalog nutrient to zero, and never uses prefix or fuzzy matching for automatic AI resolution. The original estimate and the resolution outcome are retained in the AI audit. An `AI_ESTIMATE` has no `userFoodId` or catalog snapshot, does not create or update a personal food, and remains an `OPEN` proposal requiring normal user confirmation.
+The estimate is required even when a catalog match looks likely. `estimatedQuantity` must be directly scalable from the estimate basis; the backend performs the final decimal-safe scaling. Missing model nutrition is invalid output, not a reason to omit the food or return `UNRESOLVED`.
 
-Every request requires a client-generated `Idempotency-Key` header, unique for that complete operation. Retrying the same key with the same normalized text replays the original terminal result without another model call or duplicate capture. Reusing the key for different text returns `409`. An interrupted `PROCESSING` event can be recovered after its five-minute processing lease expires; a per-attempt fencing token prevents the expired worker from committing afterward.
+The backend then resolves each food independently:
+
+1. Search only active foods owned by the authenticated user. One exact barcode/name/alias match has priority; multiple exact matches are ambiguous.
+2. Without an exact match, accept only the strongest prefix/fuzzy result when its score is at least `FITLAKE_DAILY_AI_FOOD_MATCH_MINIMUM_SCORE` (default `0.78`) and, when a runner-up exists, its lead is at least `FITLAKE_DAILY_AI_FOOD_MATCH_MINIMUM_MARGIN` (default `0.12`).
+3. Use an accepted catalog food only when all four core nutrients exist and the selected quantity converts deterministically through its immutable snapshot. Quantity priority is explicit user quantity, then the catalog's default serving, then the AI-estimated quantity.
+4. If no candidate is safely accepted, or the accepted definition is nutritionally incomplete or unconvertible, use the AI estimate as `AI_ESTIMATE`. Prefer the explicit quantity when it scales from the AI basis; otherwise use `estimatedQuantity`.
+
+A usable catalog definition becomes `USER_FOOD` and its complete calculated nutrition replaces the model estimate. The backend never mixes individual catalog and AI nutrients, never treats a missing catalog nutrient as zero, and never writes an estimate into the private catalog. An `AI_ESTIMATE` has no `userFoodId` or catalog snapshot and remains confirmable Daily state.
+
+The schema is always supplied in the prompt and parsed strictly. When `FITLAKE_DAILY_AI_NATIVE_STRUCTURED_OUTPUT_ENABLED=true`, the adapter also requests the provider-native OpenAI-compatible JSON Schema response format. It defaults to `false`; keep it disabled for the current OpenRouter model because that model rejects native JSON Schema. Schema or semantic failures receive at most `FITLAKE_DAILY_AI_MAX_STRUCTURED_OUTPUT_RETRIES` corrective calls (default `1`, maximum `3`) before the API returns `502`.
+
+Every request requires a client-generated `Idempotency-Key` header, unique for that complete operation. Retrying the same key with the same normalized text reloads the established capture in its current lifecycle state, or replays `NO_RELEVANT_DATA` or a sanitized failure, without another model call or duplicate capture. Reusing the key for different text returns `409`. An interrupted `PROCESSING` event can be recovered after its five-minute processing lease expires using the original raw input stored in the inbox event; a per-attempt fencing token prevents the expired worker from committing afterward.
 
 Create an AI proposal:
 
@@ -414,12 +433,13 @@ curl.exe -X POST "http://localhost:8080/api/daily/days/2026-07-30/messages" `
   -d '{"text":"A colazione ho mangiato uno yogurt, una banana e 40 grammi di cereali"}'
 ```
 
-A successful `createCapture` returns `201` and an `OPEN` capture. Abbreviated response:
+A `COMPLETE`, `PARTIAL`, or `UNRESOLVED` interpretation returns `201` and an `OPEN` capture. Abbreviated response:
 
 ```json
 {
   "outcome": "CAPTURE_CREATED",
   "replacedCaptureId": null,
+  "interpretationOutcome": "COMPLETE",
   "capture": {
     "captureId": "72e31175-a346-45a1-b016-366861cfcb4d",
     "dayId": "9183188b-8496-4a26-b79f-55f242640cca",
@@ -457,7 +477,7 @@ A successful `createCapture` returns `201` and an `OPEN` capture. Abbreviated re
 }
 ```
 
-`askClarification` and `noOp` return `200` and create no capture. Provider output with zero tools, multiple tools, free text beside a tool, invalid arguments, or an unsupported payload is rejected defensively.
+Only `NO_RELEVANT_DATA` returns `200` without a capture. The adapter rejects tool calls, prose surrounding the JSON object, malformed JSON, unknown fields, invalid values, and semantic/schema violations.
 
 To change the original text, the client sends the complete corrected sentence rather than a relative command:
 
@@ -469,13 +489,90 @@ curl.exe -X POST "http://localhost:8080/api/daily/captures/<OPEN_CAPTURE_ID>/rep
   -d '{"text":"A colazione ho mangiato yogurt, cereali e tre biscotti"}'
 ```
 
-On success, reprocess atomically creates a new `OPEN` capture and marks the old one `REJECTED` by `SYSTEM`; the inbox event records `replaces_capture_id`. If AI, validation, or persistence fails—or the outcome is clarification/no-op—the old capture remains `OPEN` and unchanged. Only owned, non-deleted `OPEN` captures on editable days can be reprocessed.
+On a `COMPLETE`, `PARTIAL`, or `UNRESOLVED` result, reprocess atomically creates a new `OPEN` capture and marks the old one `REJECTED` by `SYSTEM`; the inbox event records `replaces_capture_id`, and the lifecycle audit links the replacement capture. If AI, validation, or persistence fails—or the result is `NO_RELEVANT_DATA`—the old capture remains `OPEN` and unchanged. Only owned, non-deleted `OPEN` captures on editable days can be reprocessed.
 
-There is no conversational memory: each new message is autonomous, and each reprocess interprets only the full text in its latest request. The original text and a sanitized terminal audit are stored, but provider raw responses, prompts, API keys, Firebase tokens, and credentials are not.
+There is no conversational memory: each new message is autonomous, and each reprocess interprets only the full text in its latest request. `daily_inbox_event` retains the original input. `ai_interpretation_log` stores only sanitized terminal metadata and projections such as semantic outcome, retry/token counts, capture summary, match type/score/reason, quantity source, and fallback counts; provider raw responses, prompts, API keys, Firebase tokens, credentials, and chain of thought are not stored. `daily_capture_audit` separately records AI creation and system replacement lifecycle events.
+
+## Logging and operations
+
+FitLake writes technical logs to stdout through SLF4J and Spring Boot's default Logback backend. Application events use stable `snake_case` names and structured key-value fields, so production collectors can query fields such as `event`, `outcome`, `requestId`, resource IDs, status, counts, and `durationMs` without parsing user content.
+
+The available profiles are:
+
+| Profile | Console format | Effective application level | Intended use |
+| --- | --- | --- | --- |
+| no explicit profile | Human-readable | `INFO` | Safe common fallback |
+| `dev` | Human-readable | `DEBUG` for `com.fitlake` | Local diagnosis |
+| `test` | Human-readable, reduced noise | `INFO` for `com.fitlake`, root `WARN` | Automated tests |
+| `prod` | ECS structured JSON | `INFO` | Deployed runtime |
+
+Gradle test tasks activate `test` automatically; an explicit `-Dspring.profiles.active=...` remains available for a deliberate override.
+
+Select a profile before starting the process:
+
+```powershell
+$env:SPRING_PROFILES_ACTIVE='dev' # use 'prod' for ECS JSON
+.\gradlew.bat bootRun
+```
+
+The pinned Spring Boot 4.1 version supports native structured logging, so `application-prod.properties` uses `logging.structured.format.console=ecs`; no extra JSON encoder or custom Logback file is required. Production logs remain on stdout:
+
+```text
+FitLake -> ECS JSON stdout -> container/platform collector -> centralized logging
+```
+
+Configure the deployment runtime to collect stdout/stderr and apply access controls, retention, search, and export there. FitLake does not write rolling application log files and does not connect business code directly to Elasticsearch, Loki, Datadog, or another log store. If the Spring Boot baseline is changed, verify native structured-logging compatibility before changing the encoder strategy.
+
+### Request IDs
+
+Clients may send `X-Request-Id` using 1 to 100 letters, digits, dots, underscores, or hyphens. A missing or invalid value is replaced with a generated UUID. The resolved value is:
+
+- returned in every response as `X-Request-Id`;
+- available to synchronous request processing through the SLF4J MDC key `requestId`;
+- included in the safe `http_request_completed` event;
+- cleared even if request processing throws, preventing leakage when servlet threads are reused.
+
+HTTP completion logging records the method, resolved route template, status, outcome, and monotonic duration. It never logs raw URLs with identifiers, query strings, authorization data, request bodies, or response bodies. Health probes are kept below normal `INFO` volume.
+
+FitLake currently has no application-owned asynchronous request handoff. The request-ID guarantee therefore covers the synchronous servlet chain. A future `@Async`, coroutine, scheduler, custom-executor, or reactive flow must add and test Spring-supported MDC/observation context propagation explicitly.
+
+### Temporary DEBUG logging
+
+Runtime logger mutation is deliberately unavailable: management exposure contains only `health`, `/actuator/health` is public, and the Actuator `loggers` endpoint is neither exposed nor authorized. Do not expose it, or `management.endpoints.web.exposure.include=*`, without operator authentication and a private or dedicated management boundary.
+
+To diagnose one package, set a Spring Boot logging-level environment override and restart the application:
+
+```powershell
+$env:LOGGING_LEVEL_COM_FITLAKE_DAILY='DEBUG'
+.\gradlew.bat bootRun
+```
+
+Restore the configured level after diagnosis and restart again:
+
+```powershell
+Remove-Item Env:LOGGING_LEVEL_COM_FITLAKE_DAILY
+```
+
+The same pattern works for another narrow package, such as `LOGGING_LEVEL_COM_FITLAKE_AUTH`. Avoid enabling root DEBUG or SQL bind-parameter logging in production.
+
+### Privacy rules
+
+Technical logs contain operational metadata only. At every level, including DEBUG and TRACE, do not log:
+
+- Firebase tokens, authorization headers, cookies, passwords, API keys, credentials, complete JWT claims, email addresses, Firebase UIDs, or other direct identifiers;
+- food names or consumed foods, nutrition values, weight, sleep, pain, mood, stress, focus, notes, free-form activity, Daily payloads, or full catalog definitions;
+- user messages, prompts, completions, raw/structured provider output, hidden reasoning, or chain of thought;
+- raw query strings, sensitive parameters, multipart data, or request/response bodies.
+
+The common profile disables Spring AI's own log namespace and Hibernate JDBC bind/error/warning loggers because those libraries can serialize prompts, provider bodies, SQL values, or database details before FitLake can sanitize them. Spring MVC's raw unmatched-route logger is disabled, while Tomcat's HTTP parser and invalid-cookie loggers are kept at `WARN` to suppress request-target, header, and cookie dumps emitted at `INFO`. FitLake replaces these channels with stable application error codes, bounded metadata, sanitized stack traces, and the `http_request_completed` event; this trade-off is intentional and covered by configuration tests.
+
+Keep `OPENAI_LOG=off`. The OpenAI Java SDK writes HTTP diagnostics directly to stderr outside SLF4J when this environment switch is enabled, including bodies at verbose levels. FitLake validates the setting at startup and fails fast for any non-`off` value.
+
+Expected validation, missing-resource, state, idempotency, and version conflicts do not produce unexpected `ERROR` stack traces. An unexpected exception is logged once at the outer response boundary and the client receives only a safe error body. Technical logs do not replace durable `daily_capture_audit` history or sanitized `ai_interpretation_log` records; metrics and traces remain separate observability signals.
 
 ### Firebase authentication diagnostics
 
-At startup the application logs whether Application Default Credentials were loaded and which Firebase project ID was configured. Authentication failures log the Firebase error code and a sanitized reason, while token contents, emails, and service-account data remain excluded.
+At startup the application emits sanitized configuration metadata indicating whether Firebase credentials and required configuration were resolved. Authentication failures use stable error codes and never include the provider exception message, token contents, claims, email, Firebase UID, project identifier, or service-account data.
 
 For successful-verification diagnostics, enable debug logging in the run configuration:
 
@@ -494,7 +591,13 @@ $env:JAVA_HOME='C:\path\to\jdk-25'
 .\gradlew.bat test
 ```
 
-The suite includes Daily domain/use-case tests, offline Spring AI tool-calling and nutrition-fallback tests, exact/ambiguous user-food matching tests, authenticated REST tests, private-food domain/CRUD/isolation/search tests, filter and MVC security tests with a fake token verifier, and PostgreSQL/Flyway/JSONB/`pg_trgm` persistence, rollback, and concurrency tests through Testcontainers. No real Firebase or AI credentials and no provider network calls are used. PostgreSQL integration tests are skipped when Docker is unavailable.
+Run the complete verification lifecycle with:
+
+```powershell
+.\gradlew.bat check
+```
+
+The suite includes request-correlation/MDC cleanup, structured event and exception-policy checks, Daily domain/use-case tests, offline Spring AI structured-output, correction-retry, verbatim-fragment, and nutrition-fallback tests, conservative exact/strong-fuzzy user-food matching tests, authenticated REST tests, private-food domain/CRUD/isolation/search tests, filter and MVC security tests with a fake token verifier, and PostgreSQL/Flyway/JSONB/`pg_trgm` persistence, tenant-FK rejection, rollback, and concurrency tests through Testcontainers. No real Firebase or AI credentials, provider network calls, or external logging platform are used. PostgreSQL integration tests are skipped when Docker is unavailable.
 
 ## Current deliberate limits
 
@@ -502,6 +605,6 @@ The suite includes Daily domain/use-case tests, offline Spring AI tool-calling a
 - One Firebase issuer may map to only one identity per internal user.
 - A Firebase email claim is stored even when unverified and is synchronized when it changes on later logins. A missing claim does not erase the stored value, and email is never used for account resolution or merging.
 - Display name seeds the profile on first login but later token changes do not overwrite user-managed profile data.
-- Personal foods remain manually managed and private; automatic creation, barcode lookup, and external nutrition lookup are not implemented. Manual Daily linking uses an exact `userFoodId`. Natural-language insertion can only read an exact, unique active name/alias match for the authenticated user; it never uses fuzzy matching and never creates or updates catalog data.
+- Personal foods remain manually managed and private; automatic creation, barcode lookup, and external nutrition lookup are not implemented. Manual Daily linking uses an exact `userFoodId`. Natural-language insertion may use one exact match or one sufficiently strong and clearly separated prefix/fuzzy match among the authenticated user's active foods; it never creates or updates catalog data.
 - Soft-deleted personal foods cannot currently be restored through the API.
 - Account linking, account deletion, authorization roles, Telegram, conversational memory, relative AI edits, and AI-driven finalization remain future work.

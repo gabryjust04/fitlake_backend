@@ -1,6 +1,7 @@
 package com.fitlake.daily.adapter.rest
 
 import com.fitlake.daily.application.ai.DailyAiResult
+import com.fitlake.daily.application.ai.DailyMessageInterpretationOutcome
 import com.fitlake.daily.domain.capture.DailyCaptureActor
 import com.fitlake.daily.domain.capture.DailyCaptureStatus
 import com.fitlake.daily.domain.capture.DailyCaptureType
@@ -21,8 +22,7 @@ data class DailyTextMessageRequest(
 enum class DailyAiRestOutcome {
 	CAPTURE_CREATED,
 	CAPTURE_REPLACED,
-	CLARIFICATION_REQUIRED,
-	NO_OP,
+	NO_RELEVANT_DATA,
 }
 
 data class DailyAiCaptureResponse(
@@ -40,8 +40,8 @@ data class DailyAiCaptureResponse(
 data class DailyAiMessageResponse(
 	val outcome: DailyAiRestOutcome,
 	val replacedCaptureId: UUID? = null,
+	val interpretationOutcome: DailyMessageInterpretationOutcome? = null,
 	val capture: DailyAiCaptureResponse? = null,
-	val question: String? = null,
 	val reason: String? = null,
 )
 
@@ -54,6 +54,7 @@ fun DailyAiResult.toResponse(): DailyAiMessageResponse = when (this) {
 				DailyAiRestOutcome.CAPTURE_REPLACED
 			},
 			replacedCaptureId = replacedCaptureId?.value,
+			interpretationOutcome = interpretationOutcome,
 			capture = DailyAiCaptureResponse(
 				captureId = capture.captureId.value,
 				dayId = capture.dayId.value,
@@ -67,12 +68,9 @@ fun DailyAiResult.toResponse(): DailyAiMessageResponse = when (this) {
 			),
 		)
 	}
-	is DailyAiResult.ClarificationRequired -> DailyAiMessageResponse(
-		outcome = DailyAiRestOutcome.CLARIFICATION_REQUIRED,
-		question = question,
-	)
-	is DailyAiResult.NoOp -> DailyAiMessageResponse(
-		outcome = DailyAiRestOutcome.NO_OP,
+	is DailyAiResult.NoRelevantData -> DailyAiMessageResponse(
+		outcome = DailyAiRestOutcome.NO_RELEVANT_DATA,
+		interpretationOutcome = DailyMessageInterpretationOutcome.NO_RELEVANT_DATA,
 		reason = reason,
 	)
 }

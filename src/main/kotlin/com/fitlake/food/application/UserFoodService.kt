@@ -5,6 +5,7 @@ import com.fitlake.food.domain.UserFood
 import com.fitlake.food.domain.UserFoodDefinition
 import com.fitlake.food.domain.UserFoodId
 import com.fitlake.shared.application.TransactionExecutor
+import com.fitlake.shared.application.elapsedMilliseconds
 import com.fitlake.user.domain.UserId
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
@@ -17,13 +18,14 @@ class UserFoodService(
 	private val clock: Clock,
 ) {
 	fun create(userId: UserId, input: UserFoodDefinitionInput): UserFood {
+		val startedAtNanos = System.nanoTime()
 		val definition = validatedDefinition(input)
-		return transactionExecutor.required {
+		val created = transactionExecutor.required {
 			ensureUnique(userId, definition, null)
-			repository.save(UserFood.create(userId, definition, clock.instant())).also { food ->
-				logger.info("event=user_food_created userId={} foodId={}", userId, food.foodId.value)
-			}
+			repository.save(UserFood.create(userId, definition, clock.instant()))
 		}
+		logChange("user_food_created", "User food created", created, startedAtNanos)
+		return created
 	}
 
 	fun get(userId: UserId, foodId: UserFoodId): UserFood = transactionExecutor.required {
@@ -36,8 +38,9 @@ class UserFoodService(
 	}
 
 	fun replace(userId: UserId, foodId: UserFoodId, input: UserFoodDefinitionInput): UserFood {
+		val startedAtNanos = System.nanoTime()
 		val definition = validatedDefinition(input)
-		return transactionExecutor.required {
+		val replaced = transactionExecutor.required {
 			val current = requireOwned(userId, foodId)
 			ensureUnique(userId, definition, foodId)
 			val updated = try {
@@ -45,14 +48,15 @@ class UserFoodService(
 			} catch (exception: IllegalStateException) {
 				throw UserFoodConflictException(exception.message ?: "Food cannot be updated", exception)
 			}
-			repository.save(updated).also { food ->
-				logger.info("event=user_food_updated userId={} foodId={}", userId, food.foodId.value)
-			}
+			repository.save(updated)
 		}
+		logChange("user_food_updated", "User food updated", replaced, startedAtNanos)
+		return replaced
 	}
 
 	fun softDelete(userId: UserId, foodId: UserFoodId) {
-		transactionExecutor.required {
+		val startedAtNanos = System.nanoTime()
+		val deleted = transactionExecutor.required {
 			val current = requireOwned(userId, foodId)
 			val deleted = try {
 				current.softDelete(clock.instant())
@@ -60,9 +64,23 @@ class UserFoodService(
 				throw UserFoodNotFoundException(foodId.value)
 			}
 			repository.save(deleted)
-			logger.info("event=user_food_soft_deleted userId={} foodId={}", userId, foodId.value)
 			deleted
 		}
+		logChange("user_food_soft_deleted", "User food soft-deleted", deleted, startedAtNanos)
+	}
+
+	private fun logChange(event: String, message: String, food: UserFood, startedAtNanos: Long) {
+		logger.atInfo()
+			.addKeyValue("event", event)
+			.addKeyValue("outcome", "success")
+			.addKeyValue("userRef", food.userId.value)
+			.addKeyValue("userFoodId", food.foodId.value)
+			.addKeyValue("sourceType", food.source.type)
+			.addKeyValue("basisUnit", food.nutritionBasis.unit)
+			.addKeyValue("aliasCount", food.aliases.size)
+			.addKeyValue("version", food.version)
+			.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+			.log(message)
 	}
 
 	private fun requireOwned(userId: UserId, foodId: UserFoodId): UserFood =

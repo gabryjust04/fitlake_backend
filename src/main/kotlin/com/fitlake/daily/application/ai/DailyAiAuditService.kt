@@ -19,7 +19,10 @@ import com.fitlake.daily.domain.inbox.DailyInboxChannel
 import com.fitlake.daily.domain.inbox.DailyInboxEvent
 import com.fitlake.daily.domain.inbox.DailyInboxProcessingStatus
 import com.fitlake.shared.application.TransactionExecutor
+import com.fitlake.shared.application.elapsedMilliseconds
+import com.fitlake.shared.logging.sanitizedForTechnicalLogging
 import com.fitlake.user.domain.UserId
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.time.Clock
 import java.time.Duration
@@ -105,7 +108,7 @@ class DailyAiAuditService(
 					at = now,
 				),
 			)
-			DailyAiPreparation.Execute(event.toContext(day.dayDate, timezone, metadata))
+			event.toExecution(day.dayDate, timezone, metadata)
 		}
 	}
 
@@ -115,6 +118,7 @@ class DailyAiAuditService(
 		errorCode: String,
 		errorMessage: String,
 	) {
+		val startedAtNanos = System.nanoTime()
 		try {
 			transactionExecutor.required {
 				val event = inboxEventRepository.findByIdForUpdate(context.inboxEventId)
@@ -140,8 +144,19 @@ class DailyAiAuditService(
 				}
 				inboxEventRepository.save(event.failed(errorCode, errorMessage, now))
 			}
-		} catch (_: RuntimeException) {
+		} catch (exception: RuntimeException) {
 			// Preserve the original sanitized failure when even audit persistence is unavailable.
+			logger.atError()
+				.addKeyValue("event", "daily_ai_failure_record_persistence_failed")
+				.addKeyValue("outcome", "failure")
+				.addKeyValue("errorCode", "AI_AUDIT_PERSISTENCE_FAILED")
+				.addKeyValue("recordedErrorCode", errorCode)
+				.addKeyValue("userRef", context.userId.value)
+				.addKeyValue("inboxEventId", context.inboxEventId.value)
+				.addKeyValue("exceptionType", exception.javaClass.name)
+				.addKeyValue("durationMs", elapsedMilliseconds(startedAtNanos))
+				.setCause(exception.sanitizedForTechnicalLogging())
+				.log("Daily AI failure record could not be persisted")
 		}
 	}
 
@@ -184,7 +199,7 @@ class DailyAiAuditService(
 				at = now,
 			),
 		)
-		return DailyAiPreparation.Execute(event.toContext(date, timezone, metadata))
+		return event.toExecution(date, timezone, metadata)
 	}
 
 	private fun existingEvent(
@@ -232,7 +247,7 @@ class DailyAiAuditService(
 			}
 			val day = validateResume(event)
 			val renewed = inboxEventRepository.save(event.renewProcessing(now))
-			return DailyAiPreparation.Execute(renewed.toContext(day.dayDate, timezone, metadata))
+			return renewed.toExecution(day.dayDate, timezone, metadata)
 		}
 		return replayTerminal(event)
 	}
@@ -247,22 +262,26 @@ class DailyAiAuditService(
 			AiInterpretationStatus.SUCCESS -> {
 				val captureId = log.captureId
 					?: throw DailyStateCorruptionException("Successful AI interpretation has no capture")
+				val capture = captureRepository.findById(captureId)
+					?: throw DailyStateCorruptionException("Successful AI interpretation references a missing capture")
+				if (
+					capture.userId != event.userId ||
+					capture.dayId != event.dayId ||
+					capture.sourceEventId != event.inboxEventId.value
+				) {
+					throw DailyStateCorruptionException("Successful AI interpretation references the wrong capture")
+				}
 				DailyAiPreparation.Replay(
 					DailyAiResult.CaptureCreated(
 						day.dayDate,
-						log.parsedOutput.captureResult(event, captureId, log.confidence),
+						capture.toAiCaptureResult(),
 						event.replacesCaptureId,
+						log.parsedOutput.requiredInterpretationOutcome(),
 					),
 				)
 			}
-			AiInterpretationStatus.NEEDS_CLARIFICATION -> DailyAiPreparation.Replay(
-				DailyAiResult.ClarificationRequired(
-					day.dayDate,
-					log.parsedOutput.requiredString("question"),
-				),
-			)
-			AiInterpretationStatus.NO_OP -> DailyAiPreparation.Replay(
-				DailyAiResult.NoOp(day.dayDate, log.parsedOutput.requiredString("reason")),
+			AiInterpretationStatus.NO_RELEVANT_DATA -> DailyAiPreparation.Replay(
+				DailyAiResult.NoRelevantData(day.dayDate),
 			)
 			AiInterpretationStatus.FAILED,
 			AiInterpretationStatus.INVALID_OUTPUT,
@@ -274,6 +293,9 @@ class DailyAiAuditService(
 		"AI_NOT_CONFIGURED" -> DailyAiConfigurationException()
 		"AI_TIMEOUT" -> DailyAiTimeoutException()
 		"AI_PROVIDER_UNAVAILABLE" -> DailyAiProviderUnavailableException()
+		"AI_PROVIDER_AUTHENTICATION_FAILED" -> DailyAiProviderAuthenticationException()
+		"AI_PROVIDER_QUOTA_EXCEEDED" -> DailyAiProviderQuotaException()
+		"AI_PROVIDER_RATE_LIMITED" -> DailyAiRateLimitException()
 		"AI_INVALID_OUTPUT" -> DailyAiInvalidOutputException()
 		"AI_PERSISTENCE_ERROR" -> DailyAiPersistenceException()
 		"DAILY_CONFLICT" -> DailyConflictException("Daily state changed while the AI request was processed")
@@ -321,6 +343,15 @@ class DailyAiAuditService(
 		processingAttemptId = processingAttemptId,
 	)
 
+	private fun DailyInboxEvent.toExecution(
+		date: LocalDate,
+		timezone: ZoneId,
+		metadata: DailyAiProviderMetadata,
+	): DailyAiPreparation.Execute = DailyAiPreparation.Execute(
+		context = toContext(date, timezone, metadata),
+		persistedRawText = rawText,
+	)
+
 	private fun newLog(
 		context: DailyAiRequestContext,
 		status: AiInterpretationStatus,
@@ -336,8 +367,7 @@ class DailyAiAuditService(
 		provider = context.metadata.provider,
 		model = context.metadata.model,
 		promptVersion = context.metadata.promptVersion,
-		inputText = inboxEventRepository.findById(context.inboxEventId)?.rawText
-			?: throw DailyStateCorruptionException("Daily AI inbox event disappeared"),
+		inputText = null,
 		contextSnapshot = context.snapshot(),
 		parsedOutput = parsedOutput,
 		status = status,
@@ -368,8 +398,15 @@ class DailyAiAuditService(
 		(this[key] as? String)?.takeIf(String::isNotBlank)
 			?: throw DailyStateCorruptionException("AI audit output is missing $key")
 
+	private fun Map<String, Any?>.requiredInterpretationOutcome(): DailyMessageInterpretationOutcome = try {
+		DailyMessageInterpretationOutcome.valueOf(requiredString("interpretationOutcome"))
+	} catch (_: IllegalArgumentException) {
+		throw DailyStateCorruptionException("AI audit output has an invalid interpretation outcome")
+	}
+
 	private companion object {
 		val PROCESSING_LEASE: Duration = Duration.ofMinutes(5)
+		val logger = LoggerFactory.getLogger(DailyAiAuditService::class.java)
 	}
 }
 
