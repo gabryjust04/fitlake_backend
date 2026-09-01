@@ -74,6 +74,7 @@ import kotlin.test.assertEquals
 class DailyRestIntegrationTest @Autowired constructor(
 	private val mockMvc: MockMvc,
 	private val audits: InMemoryDailyCaptureAuditRepository,
+	private val storedMetrics: InMemoryDailyMetricsRepository,
 ) {
 	@Test
 	fun `daily endpoints require authentication`() {
@@ -101,6 +102,25 @@ class DailyRestIntegrationTest @Autowired constructor(
 		}.andExpect {
 			status { isOk() }
 			jsonPath("$.status") { value("ACCEPTED") }
+		}
+
+		mockMvc.get("/api/daily/days/2026-08-01/metrics") {
+			auth("valid-a")
+		}.andExpect {
+			status { isOk() }
+			jsonPath("$.status") { value("OPEN") }
+			jsonPath("$.bodyWeightKg") { value(78.4) }
+			jsonPath("$.sleepHours") { value(7.5) }
+			jsonPath("$.confirmedAt") { isEmpty() }
+		}
+
+		mockMvc.get("/api/daily/days/2026-08-01") {
+			auth("valid-a")
+		}.andExpect {
+			status { isOk() }
+			jsonPath("$.status") { value("OPEN") }
+			jsonPath("$.metrics.status") { value("OPEN") }
+			jsonPath("$.metrics.bodyWeightKg") { value(78.4) }
 		}
 
 		mockMvc.post("/api/daily/days/2026-08-01/finalize") {
@@ -139,6 +159,63 @@ class DailyRestIntegrationTest @Autowired constructor(
 			status { isConflict() }
 			jsonPath("$.error") { value("conflict") }
 		}
+	}
+
+	@Test
+	fun `open day exposes live mixed metrics from accepted captures without persisting`() {
+		val date = "2026-08-30"
+		val foodId = UUID.fromString("30303030-3030-3030-3030-303030303030")
+		val mixed = mockMvc.post("/api/daily/days/$date/captures") {
+			auth("valid-a")
+			contentType = MediaType.APPLICATION_JSON
+			content = typedMixedCaptureBody(foodId)
+		}.andExpect {
+			status { isCreated() }
+			jsonPath("$.captureType") { value("MIXED") }
+		}
+		val acceptedId = captureId(mixed.andReturn().response.contentAsString)
+		mockMvc.post("/api/daily/captures/$acceptedId/accept") { auth("valid-a") }
+			.andExpect { status { isOk() } }
+
+		createFieldsCapture(date, "valid-a").andExpect { status { isCreated() } }
+		val rejected = createFieldsCapture(date, "valid-a")
+		val rejectedId = captureId(rejected.andReturn().response.contentAsString)
+		mockMvc.post("/api/daily/captures/$rejectedId/reject") { auth("valid-a") }
+			.andExpect { status { isOk() } }
+		val deleted = mockMvc.post("/api/daily/days/$date/captures") {
+			auth("valid-a")
+			contentType = MediaType.APPLICATION_JSON
+			content = typedFoodCaptureBody(foodId)
+		}.andExpect { status { isCreated() } }
+		val deletedId = captureId(deleted.andReturn().response.contentAsString)
+		mockMvc.delete("/api/daily/captures/$deletedId") { auth("valid-a") }
+			.andExpect { status { isOk() } }
+		val savesBeforeReads = storedMetrics.saveCount
+
+		mockMvc.get("/api/daily/days/$date/metrics") { auth("valid-a") }
+			.andExpect {
+				status { isOk() }
+				jsonPath("$.status") { value("OPEN") }
+				jsonPath("$.bodyWeightKg") { value(78) }
+				jsonPath("$.sleepHours") { isEmpty() }
+				jsonPath("$.totalCalories") { value(105.4) }
+				jsonPath("$.proteinG") { value(16.15) }
+				jsonPath("$.foodLog.length()") { value(1) }
+				jsonPath("$.generatedFromCaptureIds.length()") { value(1) }
+				jsonPath("$.generatedFromCaptureIds[0]") { value(acceptedId) }
+				jsonPath("$.confirmedAt") { isEmpty() }
+			}
+
+		mockMvc.get("/api/daily/days/$date") { auth("valid-a") }
+			.andExpect {
+				status { isOk() }
+				jsonPath("$.status") { value("OPEN") }
+				jsonPath("$.metrics.status") { value("OPEN") }
+				jsonPath("$.metrics.totalCalories") { value(105.4) }
+				jsonPath("$.captures.length()") { value(4) }
+			}
+
+		assertEquals(savesBeforeReads, storedMetrics.saveCount)
 	}
 
 	@Test
@@ -182,6 +259,18 @@ class DailyRestIntegrationTest @Autowired constructor(
 	@Test
 	fun `open captures block day finalization`() {
 		createFieldsCapture("2026-08-02", "valid-a")
+		val savesBeforeRead = storedMetrics.saveCount
+
+		mockMvc.get("/api/daily/days/2026-08-02/metrics") { auth("valid-a") }
+			.andExpect {
+				status { isOk() }
+				jsonPath("$.status") { value("OPEN") }
+				jsonPath("$.bodyWeightKg") { isEmpty() }
+				jsonPath("$.totalCalories") { isEmpty() }
+				jsonPath("$.foodLog.length()") { value(0) }
+				jsonPath("$.generatedFromCaptureIds.length()") { value(0) }
+			}
+		assertEquals(savesBeforeRead, storedMetrics.saveCount)
 
 		mockMvc.post("/api/daily/days/2026-08-02/finalize") {
 			auth("valid-a")
@@ -552,6 +641,15 @@ class DailyRestIntegrationTest @Autowired constructor(
 				}
 				jsonPath("$.components.schemas.DailyFoodItemRequest.properties.sourceType.description") {
 					value(org.hamcrest.Matchers.containsString("cannot create or edit an estimate"))
+				}
+				jsonPath("$.paths['/api/daily/days/{date}/metrics'].get.description") {
+					value(org.hamcrest.Matchers.containsString("OPEN day"))
+				}
+				jsonPath("$.paths['/api/daily/days/{date}/metrics'].get.description") {
+					value(org.hamcrest.Matchers.containsString("does not persist metrics"))
+				}
+				jsonPath("$.paths['/api/daily/days/{date}'].get.description") {
+					value(org.hamcrest.Matchers.containsString("calculated on demand"))
 				}
 				jsonPath("$.paths['/api/daily/days/{date}/metrics'].get.description") {
 					value(org.hamcrest.Matchers.containsString("REOPENED"))

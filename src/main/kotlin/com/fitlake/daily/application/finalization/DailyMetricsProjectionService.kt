@@ -12,6 +12,22 @@ import java.time.Instant
 
 @Service
 class DailyMetricsProjectionService {
+	fun projectCurrent(
+		day: DailyDay,
+		captures: List<DailyCapture>,
+	): DailyMetrics {
+		check(day.status == DailyDayStatus.OPEN) { "Only an open day can expose current metrics" }
+		val projectedAt = captures
+			.maxOfOrNull(DailyCapture::updatedAt)
+			?.let { maxOf(day.updatedAt, it) }
+			?: day.updatedAt
+		return project(day, captures, existing = null, at = projectedAt).copy(
+			status = DailyDayStatus.OPEN,
+			confirmedAt = null,
+			recalculatedAt = null,
+		)
+	}
+
 	fun project(
 		day: DailyDay,
 		captures: List<DailyCapture>,

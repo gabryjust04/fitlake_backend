@@ -3,18 +3,26 @@ package com.fitlake.daily.application
 import com.fitlake.daily.application.port.DailyCaptureRepository
 import com.fitlake.daily.application.port.DailyDayRepository
 import com.fitlake.daily.application.port.DailyMetricsRepository
+import com.fitlake.daily.application.finalization.DailyMetricsProjectionService
 import com.fitlake.daily.domain.capture.DailyCapture
+import com.fitlake.daily.domain.capture.DailyCapturePayload
+import com.fitlake.daily.domain.capture.DailyFoodQuantityUnit
 import com.fitlake.daily.domain.common.DailyDay
 import com.fitlake.daily.domain.common.DailyDayId
+import com.fitlake.daily.domain.common.DailyDayStatus
 import com.fitlake.daily.domain.metrics.DailyMetrics
 import com.fitlake.shared.application.TransactionExecutor
 import com.fitlake.support.InMemoryDailyCaptureRepository
 import com.fitlake.support.InMemoryDailyDayRepository
 import com.fitlake.support.InMemoryDailyMetricsRepository
+import com.fitlake.support.dailyFieldsPayload
+import com.fitlake.support.dailyFoodPayload
+import com.fitlake.support.manualNutritionItem
 import com.fitlake.user.domain.UserId
 import org.junit.jupiter.api.Test
 import java.time.Instant
 import java.time.LocalDate
+import java.math.BigDecimal
 import java.util.UUID
 import kotlin.test.assertEquals
 
@@ -31,20 +39,109 @@ class DailyQueryServiceTest {
 		val days = SnapshotDayRepository(storedDays, transaction)
 		val captures = SnapshotCaptureRepository(storedCaptures, transaction)
 		val metrics = SnapshotMetricsRepository(storedMetrics, transaction)
-		val service = DailyQueryService(days, captures, metrics, transaction)
+		val service = DailyQueryService(days, captures, metrics, DailyMetricsProjectionService(), transaction)
 
 		val view = service.getDay(userId, date)
 
 		assertEquals(day, view.day)
 		assertEquals(emptyList(), view.captures)
-		assertEquals(null, view.metrics)
+		assertEquals(DailyDayStatus.OPEN, view.metrics?.status)
+		assertEquals(null, view.metrics?.totalCalories)
+		assertEquals(emptyList(), view.metrics?.foodLog)
+		assertEquals(emptyList(), view.metrics?.generatedFromCaptureIds)
+		assertEquals(null, view.metrics?.confirmedAt)
+		assertEquals(0, storedMetrics.saveCount)
 		assertEquals(1, transaction.requiredCalls)
 		assertEquals(1, days.lockedReads)
 		assertEquals(0, days.unlockedReads)
 		assertEquals(
-			listOf("transaction:start", "day:lock", "captures:read", "metrics:read", "transaction:end"),
+			listOf("transaction:start", "day:lock", "captures:read", "transaction:end"),
 			transaction.events,
 		)
+	}
+
+	@Test
+	fun `open day metrics reuse finalization projection and never persist`() {
+		val transaction = RecordingTransactionExecutor()
+		val days = InMemoryDailyDayRepository()
+		val captures = InMemoryDailyCaptureRepository()
+		val metrics = InMemoryDailyMetricsRepository()
+		val userId = UserId(UUID.randomUUID())
+		val date = LocalDate.parse("2026-08-02")
+		val openedAt = Instant.parse("2026-08-02T08:00:00Z")
+		val day = days.save(DailyDay.open(userId, date, openedAt))
+		val mixedPayload = DailyCapturePayload.fromEntries(
+			dailyFoodPayload(
+				listOf(
+					manualNutritionItem(
+						foodName = "accepted stored snapshot",
+						quantity = BigDecimal("100"),
+						unit = DailyFoodQuantityUnit.GRAM,
+						calories = BigDecimal("250"),
+						protein = BigDecimal("20"),
+						carbohydrates = BigDecimal("30"),
+						fat = BigDecimal("8"),
+					),
+			),
+		).entries + dailyFieldsPayload(bodyWeightKg = BigDecimal("78.2")).entries,
+		)
+		val acceptedMixed = captures.save(
+			DailyCapture.openFromUser(userId, day.dayId, mixedPayload, openedAt.plusSeconds(10))
+				.accept(openedAt.plusSeconds(20)),
+		)
+		captures.save(
+			DailyCapture.openFromUser(
+				userId,
+				day.dayId,
+				dailyFieldsPayload(sleepHours = BigDecimal("3")),
+				openedAt.plusSeconds(30),
+			),
+		)
+		captures.save(
+			DailyCapture.openFromUser(
+				userId,
+				day.dayId,
+				dailyFieldsPayload(bodyWeightKg = BigDecimal("499")),
+				openedAt.plusSeconds(40),
+			).reject(openedAt.plusSeconds(50)),
+		)
+		captures.save(
+			DailyCapture.openFromUser(
+				userId,
+				day.dayId,
+				dailyFoodPayload(
+					listOf(
+						manualNutritionItem(
+							foodName = "deleted stored snapshot",
+							quantity = BigDecimal.ONE,
+							unit = DailyFoodQuantityUnit.SERVING,
+							calories = BigDecimal("900"),
+						),
+					),
+				),
+				openedAt.plusSeconds(60),
+			).accept(openedAt.plusSeconds(70)).softDelete(openedAt.plusSeconds(80)),
+		)
+		val service = DailyQueryService(
+			days,
+			captures,
+			metrics,
+			DailyMetricsProjectionService(),
+			transaction,
+		)
+
+		val current = service.getMetrics(userId, date)
+		val dayView = service.getDay(userId, date)
+
+		assertEquals(DailyDayStatus.OPEN, current.status)
+		assertEquals(BigDecimal("78.2"), current.bodyWeightKg)
+		assertEquals(null, current.sleepHours)
+		assertEquals(BigDecimal("250"), current.totalCalories)
+		assertEquals(BigDecimal("20"), current.proteinG)
+		assertEquals(listOf(acceptedMixed.captureId.value), current.generatedFromCaptureIds)
+		assertEquals(current, dayView.metrics)
+		assertEquals(DailyDayStatus.OPEN, days.findById(day.dayId)?.status)
+		assertEquals(0, metrics.saveCount)
 	}
 
 	private class RecordingTransactionExecutor : TransactionExecutor {

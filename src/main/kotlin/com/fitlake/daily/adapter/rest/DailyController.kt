@@ -164,11 +164,14 @@ class DailyController(
 
 	@GetMapping("/days/{date}")
 	@Operation(
-		summary = "Read a day with captures and finalized metrics",
+		summary = "Read a day with captures and current metrics",
+		description = "For an OPEN day, metrics are calculated on demand from its current ACCEPTED captures without " +
+			"persisting or finalizing the day. CONFIRMED days return their persisted metrics snapshot; a REOPENED day " +
+			"continues to expose its explicitly stale persisted snapshot until it is finalized again.",
 		responses = [
 			ApiResponse(
 				responseCode = "200",
-				description = "Owned day with captures and its metrics snapshot when present",
+				description = "Owned day with captures and live OPEN metrics or its persisted snapshot",
 				content = [Content(
 					mediaType = "application/json",
 					schema = Schema(implementation = DailyDayResponse::class),
@@ -196,12 +199,15 @@ class DailyController(
 
 	@GetMapping("/days/{date}/metrics")
 	@Operation(
-		summary = "Read the current daily metrics snapshot",
-		description = "Returns CONFIRMED metrics, or the explicitly stale REOPENED snapshot after a day is reopened.",
+		summary = "Read current daily metrics",
+		description = "For an OPEN day, calculates metrics on demand from current ACCEPTED captures only; OPEN, " +
+			"REJECTED, SOFT_DELETED, and EXPIRED captures are ignored. The calculation uses stored capture snapshots, " +
+			"does not rerun AI or food resolution, does not persist metrics, and does not finalize the day. A CONFIRMED " +
+			"day returns its persisted snapshot; a REOPENED day returns its explicitly stale persisted snapshot.",
 		responses = [
 			ApiResponse(
 				responseCode = "200",
-				description = "Current owned metrics snapshot",
+				description = "Live metrics for an OPEN day or the owned persisted metrics snapshot",
 				content = [Content(
 					mediaType = "application/json",
 					schema = Schema(implementation = DailyMetricsResponse::class),
@@ -231,7 +237,7 @@ class DailyController(
 	@Operation(
 		summary = "Accept an open capture",
 		description = "Transitions an owned OPEN capture to ACCEPTED on an OPEN or REOPENED day. " +
-			"Accepted captures contribute to metrics when the day is finalized.",
+			"Accepted captures contribute immediately to live metrics on an OPEN day and to the next finalization.",
 		responses = [
 			ApiResponse(
 				responseCode = "200",
